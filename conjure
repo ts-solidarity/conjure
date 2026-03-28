@@ -124,21 +124,13 @@ def ensure_logged_in(page, svc, headless=True):
 
 def wait_response_done(page, svc, timeout=180):
     time.sleep(3)
-
-    # Wait for response to start (ensures we don't return before generation begins)
-    response_sel = svc.get("response_sel")
-    if response_sel:
-        try:
-            page.wait_for_selector(response_sel, timeout=30000)
-        except PlaywrightTimeout:
-            pass
-
     deadline = time.time() + timeout
+    response_sel = svc.get("response_sel")
     last_content = ""
     stable_since = None
 
     while time.time() < deadline:
-        # Stop button detection (works for ChatGPT)
+        # Stop button detection
         generating = any(
             page.locator(sel).count() > 0 for sel in svc["stop_sels"]
         )
@@ -148,15 +140,9 @@ def wait_response_done(page, svc, timeout=180):
                 page.locator(sel).count() > 0 for sel in svc["stop_sels"]
             )
             if not still:
-                # Wait for DALL-E "Creating image" to finish (ChatGPT)
-                while time.time() < deadline:
-                    if page.locator('text="Creating image"').count() == 0:
-                        break
-                    time.sleep(2)
                 return True
 
-        # Content stability fallback (works for Gemini where stop button lingers)
-        # Uses innerHTML so it catches both text and image changes
+        # Gemini: content stability fallback (stop button lingers)
         if response_sel:
             try:
                 els = page.locator(response_sel)
@@ -177,37 +163,23 @@ def wait_response_done(page, svc, timeout=180):
     return False
 
 
-def wait_for_images_stable(page, before_srcs, timeout=120):
-    last_state = None
-    stable_since = None
+def wait_for_images(page, before_srcs, timeout=300):
+    """Wait until at least one new high-res image appears."""
     deadline = time.time() + timeout
 
     while time.time() < deadline:
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-        state = []
         for img in page.locator("img").all():
             try:
                 src = img.get_attribute("src") or ""
                 if src in before_srcs or src.startswith("data:image/svg"):
                     continue
                 natural_w = img.evaluate("el => el.naturalWidth")
-                if natural_w < 100:
-                    continue
-                complete = img.evaluate("el => el.complete")
-                state.append((src, natural_w, complete))
+                if natural_w >= 512:
+                    time.sleep(5)
+                    return True
             except Exception:
                 continue
-
-        state_key = str(state)
-        if state and state_key == last_state:
-            if stable_since is None:
-                stable_since = time.time()
-            elif time.time() - stable_since >= 10:
-                return True
-        else:
-            last_state = state_key
-            stable_since = None
-
         time.sleep(2)
 
     return False
@@ -381,7 +353,7 @@ def do_generate(service_name, prompt, edit_image=None):
             print("Warning: timed out waiting for response.")
 
         print("Waiting for image to finish rendering...")
-        if not wait_for_images_stable(page, before_srcs, timeout=120):
+        if not wait_for_images(page, before_srcs):
             print("Warning: images may not be fully rendered.")
 
         # Find and save the best image
@@ -391,10 +363,20 @@ def do_generate(service_name, prompt, edit_image=None):
         filepath = output_dir / filename
 
         best = find_best_image(page, before_srcs)
+        if not best:
+            # Retry — image may still be loading
+            for _ in range(3):
+                time.sleep(10)
+                best = find_best_image(page, before_srcs)
+                if best:
+                    break
+
         if best and save_image(page, best, filepath, service_name):
             print(f"Saved: {filepath}")
         else:
-            print("No image found in response.")
+            debug = output_dir / f"{slug}-{timestamp}-debug.png"
+            page.screenshot(path=str(debug), full_page=True)
+            print(f"No image found in response. Debug screenshot: {debug}")
 
     except KeyboardInterrupt:
         print("\nCancelled.")
