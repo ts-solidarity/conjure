@@ -30,7 +30,7 @@ conjure --login chatgpt
 conjure --login gemini
 ```
 
-This opens a visible browser window. Log in normally — your session is saved to `~/.config/image-gen/` and reused for future headless runs.
+This opens a visible browser window. Log in normally — your session is saved to `~/.config/conjure/` and reused for future headless runs.
 
 ## How it works
 

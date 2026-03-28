@@ -16,7 +16,7 @@ except ImportError:
     print("  cd conjure && ./setup")
     sys.exit(1)
 
-CONFIG_DIR = Path.home() / ".config" / "image-gen"
+CONFIG_DIR = Path.home() / ".config" / "conjure"
 
 SERVICES = {
     "chatgpt": {

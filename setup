@@ -19,7 +19,7 @@ echo ""
 echo "Done! Usage:"
 echo '  conjure "a cat wearing a top hat"'
 echo ""
-echo "First run will open a browser - log in to ChatGPT once and your session is saved."
+echo "First run: log in with 'conjure --login chatgpt' or 'conjure --login gemini'."
 
 # Check if ~/.local/bin is in PATH
 if [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
