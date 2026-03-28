@@ -5,12 +5,12 @@ CLI tool that generates images through ChatGPT and Gemini by automating their we
 ## Setup
 
 ```
-git clone https://github.com/fearth/conjure.git
+git clone https://github.com/ts-solidarity/conjure.git
 cd conjure
 ./setup
 ```
 
-This creates a Python venv, installs [Playwright](https://playwright.dev/) with Chromium, and symlinks `conjure` into `~/.local/bin/`.
+This creates a Python venv, installs [Playwright](https://playwright.dev/) + [cloakbrowser](https://pypi.org/project/cloakbrowser/) with Chromium, and symlinks `conjure` into `~/.local/bin/`.
 
 ## Usage
 
@@ -34,7 +34,7 @@ This opens a visible browser window. Log in normally — your session is saved t
 
 ## How it works
 
-1. Launches a headless Chromium instance with a persistent profile (session cookies)
+1. Launches a headless Chromium instance via cloakbrowser with a persistent profile (session cookies)
 2. Navigates to ChatGPT or Gemini and submits an image generation prompt
 3. Waits for the response to complete (stop-button detection + content stability)
 4. Finds the largest new image on the page and downloads it via an in-page `fetch()`
