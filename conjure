@@ -148,6 +148,11 @@ def wait_response_done(page, svc, timeout=180):
                 page.locator(sel).count() > 0 for sel in svc["stop_sels"]
             )
             if not still:
+                # Wait for DALL-E "Creating image" to finish (ChatGPT)
+                while time.time() < deadline:
+                    if page.locator('text="Creating image"').count() == 0:
+                        break
+                    time.sleep(2)
                 return True
 
         # Content stability fallback (works for Gemini where stop button lingers)
