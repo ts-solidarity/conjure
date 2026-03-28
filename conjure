@@ -196,10 +196,29 @@ def wait_for_images_stable(page, before_srcs, timeout=120):
     return False
 
 
-def save_image(page, img_element, filepath):
-    src = img_element.get_attribute("src") or ""
+def save_image_via_download(page, img_element, filepath):
+    """Hover over image and click the native download button (Gemini)."""
+    try:
+        img_element.hover()
+        time.sleep(1)
+        btn = page.locator('button[aria-label="Download full size image"]')
+        if btn.count() == 0 or not btn.is_visible():
+            return False
+        with page.expect_download(timeout=30000) as dl_info:
+            btn.click()
+        dl = dl_info.value
+        dl.save_as(str(filepath))
+        if filepath.stat().st_size > 1024:
+            return True
+        filepath.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return False
 
-    # Fetch via browser (includes session cookies)
+
+def save_image_via_fetch(page, img_element, filepath):
+    """Fetch the image src through the browser (includes session cookies)."""
+    src = img_element.get_attribute("src") or ""
     try:
         b64 = page.evaluate("""async (src) => {
             const resp = await fetch(src);
@@ -234,6 +253,13 @@ def save_image(page, img_element, filepath):
         pass
 
     return False
+
+
+def save_image(page, img_element, filepath, service_name):
+    if service_name == "gemini":
+        if save_image_via_download(page, img_element, filepath):
+            return True
+    return save_image_via_fetch(page, img_element, filepath)
 
 
 def find_best_image(page, before_srcs):
@@ -362,7 +388,7 @@ def do_generate(service_name, prompt):
         filepath = output_dir / filename
 
         best = find_best_image(page, before_srcs)
-        if best and save_image(page, best, filepath):
+        if best and save_image(page, best, filepath, service_name):
             print(f"Saved: {filepath}")
         else:
             print("No image found in response.")
