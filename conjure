@@ -1,0 +1,414 @@
+#!/home/fearth/Projects/conjure/.venv/bin/python3
+"""Conjure images via ChatGPT or Gemini browser automation."""
+
+import sys
+import re
+import time
+import base64
+from pathlib import Path
+from datetime import datetime
+
+try:
+    from playwright.sync_api import TimeoutError as PlaywrightTimeout
+    from cloakbrowser import launch_persistent_context as cloak_launch
+except ImportError:
+    print("Dependencies missing. Run setup first:")
+    print("  cd conjure && ./setup")
+    sys.exit(1)
+
+CONFIG_DIR = Path.home() / ".config" / "image-gen"
+
+SERVICES = {
+    "chatgpt": {
+        "url": "https://chatgpt.com/",
+        "profile": CONFIG_DIR / "chatgpt-profile",
+        "input_sel": "#prompt-textarea",
+        "send_sel": 'button[data-testid="send-button"]',
+        "stop_sels": [
+            'button[aria-label="Stop generating"]',
+            'button[data-testid="stop-button"]',
+        ],
+        "login_sels": 'button:has-text("Log in"), a:has-text("Log in"), button:has-text("Sign up"), a:has-text("Sign up")',
+        "prompt_prefix": "Generate an image: ",
+    },
+    "gemini": {
+        "url": "https://gemini.google.com/app",
+        "profile": CONFIG_DIR / "gemini-profile",
+        "input_sel": ".ql-editor",
+        "send_sel": 'button[aria-label="Send message"]',
+        "stop_sels": [
+            'button[aria-label="Stop response"]',
+        ],
+        "response_sel": "message-content",
+        "login_sels": 'a:has-text("Sign in"), button:has-text("Sign in")',
+        "prompt_prefix": "Generate an image of ",
+    },
+}
+
+
+# ── Shared utilities ──────────────────────────────────────────────
+
+
+def slugify(text: str, max_len: int = 40) -> str:
+    s = re.sub(r"[^\w\s-]", "", text.lower())
+    s = re.sub(r"[-\s]+", "-", s).strip("-")
+    return s[:max_len].rstrip("-")
+
+
+def get_page_image_srcs(page) -> set:
+    srcs = set()
+    for img in page.locator("img").all():
+        try:
+            src = img.get_attribute("src")
+            if src:
+                srcs.add(src)
+        except Exception:
+            pass
+    return srcs
+
+
+def launch_browser(profile_dir, headless=True):
+    profile_dir.mkdir(parents=True, exist_ok=True)
+    ctx = cloak_launch(
+        str(profile_dir),
+        headless=headless,
+        viewport={"width": 1280, "height": 900},
+        args=["--ozone-platform=x11"],
+    )
+    page = ctx.pages[0] if ctx.pages else ctx.new_page()
+    return ctx, page
+
+
+def is_logged_in(page, svc):
+    login_btns = page.locator(svc["login_sels"])
+    return login_btns.count() == 0
+
+
+def ensure_logged_in(page, svc):
+    try:
+        page.wait_for_selector(svc["input_sel"], timeout=15000)
+    except PlaywrightTimeout:
+        pass
+
+    if not is_logged_in(page, svc):
+        print("Not logged in. Please log in in the browser window...")
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            if is_logged_in(page, svc):
+                print("Logged in!")
+                time.sleep(2)
+                try:
+                    page.wait_for_selector(svc["input_sel"], timeout=30000)
+                except PlaywrightTimeout:
+                    pass
+                return
+            time.sleep(1)
+        print("Login timed out.")
+        sys.exit(1)
+
+
+def wait_response_done(page, svc, timeout=180):
+    time.sleep(3)
+
+    # Wait for response to start (ensures we don't return before generation begins)
+    response_sel = svc.get("response_sel")
+    if response_sel:
+        try:
+            page.wait_for_selector(response_sel, timeout=30000)
+        except PlaywrightTimeout:
+            pass
+
+    deadline = time.time() + timeout
+    last_content = ""
+    stable_since = None
+
+    while time.time() < deadline:
+        # Stop button detection (works for ChatGPT)
+        generating = any(
+            page.locator(sel).count() > 0 for sel in svc["stop_sels"]
+        )
+        if not generating:
+            time.sleep(2)
+            still = any(
+                page.locator(sel).count() > 0 for sel in svc["stop_sels"]
+            )
+            if not still:
+                return True
+
+        # Content stability fallback (works for Gemini where stop button lingers)
+        # Uses innerHTML so it catches both text and image changes
+        if response_sel:
+            try:
+                els = page.locator(response_sel)
+                if els.count() > 0:
+                    content = els.last.evaluate("el => el.innerHTML")
+                    if content and content == last_content:
+                        if stable_since is None:
+                            stable_since = time.time()
+                        elif time.time() - stable_since >= 8:
+                            return True
+                    else:
+                        last_content = content
+                        stable_since = None
+            except Exception:
+                pass
+
+        time.sleep(1)
+    return False
+
+
+def wait_for_images_stable(page, before_srcs, timeout=120):
+    last_state = None
+    stable_since = None
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        state = []
+        for img in page.locator("img").all():
+            try:
+                src = img.get_attribute("src") or ""
+                if src in before_srcs or src.startswith("data:image/svg"):
+                    continue
+                box = img.bounding_box()
+                if not box or box["width"] < 100 or box["height"] < 100:
+                    continue
+                natural_w = img.evaluate("el => el.naturalWidth")
+                complete = img.evaluate("el => el.complete")
+                state.append((src, natural_w, complete))
+            except Exception:
+                continue
+
+        state_key = str(state)
+        if state and state_key == last_state:
+            if stable_since is None:
+                stable_since = time.time()
+            elif time.time() - stable_since >= 10:
+                return True
+        else:
+            last_state = state_key
+            stable_since = None
+
+        time.sleep(2)
+
+    return False
+
+
+def save_image(page, img_element, filepath):
+    src = img_element.get_attribute("src") or ""
+
+    # Fetch via browser (includes session cookies)
+    try:
+        b64 = page.evaluate("""async (src) => {
+            const resp = await fetch(src);
+            const blob = await resp.blob();
+            return new Promise((resolve) => {
+                const reader = new FileReader();
+                reader.onloadend = () => resolve(reader.result.split(',')[1]);
+                reader.readAsDataURL(blob);
+            });
+        }""", src)
+        filepath.write_bytes(base64.b64decode(b64))
+        if filepath.stat().st_size > 1024:
+            return True
+        filepath.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    # Canvas fallback
+    try:
+        b64 = img_element.evaluate("""el => {
+            const canvas = document.createElement('canvas');
+            canvas.width = el.naturalWidth;
+            canvas.height = el.naturalHeight;
+            canvas.getContext('2d').drawImage(el, 0, 0);
+            return canvas.toDataURL('image/png').split(',')[1];
+        }""")
+        filepath.write_bytes(base64.b64decode(b64))
+        if filepath.stat().st_size > 1024:
+            return True
+        filepath.unlink(missing_ok=True)
+    except Exception:
+        pass
+
+    return False
+
+
+def find_best_image(page, before_srcs):
+    """Find the best new large image on the page."""
+    candidates = []
+    for img in page.locator("img").all():
+        try:
+            src = img.get_attribute("src") or ""
+            if src in before_srcs or src.startswith("data:image/svg"):
+                continue
+            box = img.bounding_box()
+            if not box or box["width"] < 150 or box["height"] < 150:
+                continue
+            natural_w = img.evaluate("el => el.naturalWidth")
+            if natural_w < 512:
+                continue
+            candidates.append((img, box, natural_w))
+        except Exception:
+            continue
+
+    if not candidates:
+        return None
+
+    # Dedup by src
+    seen_srcs = {}
+    src_deduped = []
+    for img, box, nw in candidates:
+        src = img.get_attribute("src") or ""
+        if src in seen_srcs:
+            if nw > seen_srcs[src][2]:
+                src_deduped = [
+                    (i, b, n) if i.get_attribute("src") != src else (img, box, nw)
+                    for i, b, n in src_deduped
+                ]
+                seen_srcs[src] = (img, box, nw)
+        else:
+            seen_srcs[src] = (img, box, nw)
+            src_deduped.append((img, box, nw))
+
+    # Dedup by proximity
+    final = []
+    for img, box, nw in src_deduped:
+        merged = False
+        for i, (fimg, fbox, fnw) in enumerate(final):
+            if abs(box["x"] - fbox["x"]) < 100 and abs(box["y"] - fbox["y"]) < 100:
+                if nw > fnw:
+                    final[i] = (img, box, nw)
+                merged = True
+                break
+        if not merged:
+            final.append((img, box, nw))
+
+    if not final:
+        return None
+
+    return max(final, key=lambda x: x[2])[0]
+
+
+# ── Commands ──────────────────────────────────────────────────────
+
+
+def do_login(service_name):
+    svc = SERVICES[service_name]
+    print(f"Opening {service_name} for login...")
+    ctx, page = launch_browser(svc["profile"], headless=False)
+    try:
+        page.goto(svc["url"])
+        ensure_logged_in(page, svc)
+        print(f"Session saved for {service_name}.")
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+    finally:
+        ctx.close()
+
+
+def do_generate(service_name, prompt):
+    svc = SERVICES[service_name]
+    output_dir = Path.cwd()
+
+    print(f"Generating ({service_name}): {prompt}")
+
+    ctx, page = launch_browser(svc["profile"])
+
+    try:
+        page.goto(svc["url"])
+        ensure_logged_in(page, svc)
+
+        page.wait_for_selector(svc["input_sel"], timeout=15000)
+
+        # Snapshot current images
+        before_srcs = get_page_image_srcs(page)
+
+        # Type prompt
+        textarea = page.locator(svc["input_sel"])
+        textarea.click()
+        time.sleep(0.3)
+
+        full_prompt = svc["prompt_prefix"] + prompt
+        try:
+            textarea.fill(full_prompt)
+        except Exception:
+            page.keyboard.type(full_prompt, delay=10)
+
+        time.sleep(0.5)
+
+        # Submit
+        send = page.locator(svc["send_sel"])
+        if send.count() > 0 and send.is_enabled():
+            send.click()
+        else:
+            page.keyboard.press("Enter")
+
+        print("Waiting for image generation (this can take a minute)...")
+
+        if not wait_response_done(page, svc, timeout=180):
+            print("Warning: timed out waiting for response.")
+
+        print("Waiting for image to finish rendering...")
+        if not wait_for_images_stable(page, before_srcs, timeout=120):
+            print("Warning: images may not be fully rendered.")
+
+        # Find and save the best image
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        slug = slugify(prompt)
+        filename = f"{slug}-{timestamp}.png"
+        filepath = output_dir / filename
+
+        best = find_best_image(page, before_srcs)
+        if best and save_image(page, best, filepath):
+            print(f"Saved: {filepath}")
+        else:
+            print("No image found in response.")
+
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+    finally:
+        ctx.close()
+
+
+# ── CLI ───────────────────────────────────────────────────────────
+
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print('Usage: conjure --chatgpt "<image description>"')
+        print('       conjure --gemini  "<image description>"')
+        print("       conjure --login chatgpt|gemini")
+        sys.exit(0)
+
+    if args[0] == "--login":
+        service = args[1] if len(args) > 1 else "chatgpt"
+        if service not in SERVICES:
+            print(f"Unknown service: {service}. Use: chatgpt, gemini")
+            sys.exit(1)
+        do_login(service)
+        sys.exit(0)
+
+    # Determine service from flag
+    service = None
+    if args[0] == "--chatgpt":
+        service = "chatgpt"
+        args = args[1:]
+    elif args[0] == "--gemini":
+        service = "gemini"
+        args = args[1:]
+    else:
+        print("Specify a service: --chatgpt or --gemini")
+        sys.exit(1)
+
+    if not args:
+        print('Usage: conjure --chatgpt "<image description>"')
+        sys.exit(1)
+
+    prompt = " ".join(args)
+    do_generate(service, prompt)
+
+
+if __name__ == "__main__":
+    main()
