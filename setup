@@ -11,6 +11,9 @@ echo "Installing dependencies..."
 "$VENV_DIR/bin/pip" install cloakbrowser
 "$VENV_DIR/bin/playwright" install chromium
 
+# Fix shebang to point to this machine's venv
+sed -i "1s|^#!.*|#!$VENV_DIR/bin/python3|" "$SCRIPT_DIR/conjure"
+
 # Make conjure command available globally
 mkdir -p ~/.local/bin
 ln -sf "$SCRIPT_DIR/conjure" ~/.local/bin/conjure

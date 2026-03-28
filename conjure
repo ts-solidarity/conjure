@@ -84,13 +84,16 @@ def is_logged_in(page, svc):
     return login_btns.count() == 0
 
 
-def ensure_logged_in(page, svc):
+def ensure_logged_in(page, svc, headless=True):
     try:
         page.wait_for_selector(svc["input_sel"], timeout=15000)
     except PlaywrightTimeout:
         pass
 
     if not is_logged_in(page, svc):
+        if headless:
+            print("Not logged in. Run 'conjure --login' first.")
+            sys.exit(1)
         print("Not logged in. Please log in in the browser window...")
         deadline = time.time() + 300
         while time.time() < deadline:
@@ -298,7 +301,7 @@ def do_login(service_name):
     ctx, page = launch_browser(svc["profile"], headless=False)
     try:
         page.goto(svc["url"])
-        ensure_logged_in(page, svc)
+        ensure_logged_in(page, svc, headless=False)
         print(f"Session saved for {service_name}.")
     except KeyboardInterrupt:
         print("\nCancelled.")
@@ -377,9 +380,11 @@ def main():
     args = sys.argv[1:]
 
     if not args or args[0] in ("-h", "--help"):
-        print('Usage: conjure --chatgpt "<image description>"')
-        print('       conjure --gemini  "<image description>"')
-        print("       conjure --login chatgpt|gemini")
+        print('Usage: conjure "<image description>"')
+        print('       conjure --gemini "<image description>"')
+        print("       conjure --login [chatgpt|gemini]")
+        print("")
+        print("Defaults to chatgpt when no service is specified.")
         sys.exit(0)
 
     if args[0] == "--login":
@@ -390,8 +395,7 @@ def main():
         do_login(service)
         sys.exit(0)
 
-    # Determine service from flag
-    service = None
+    # Determine service from flag (default: chatgpt)
     if args[0] == "--chatgpt":
         service = "chatgpt"
         args = args[1:]
@@ -399,11 +403,10 @@ def main():
         service = "gemini"
         args = args[1:]
     else:
-        print("Specify a service: --chatgpt or --gemini")
-        sys.exit(1)
+        service = "chatgpt"
 
     if not args:
-        print('Usage: conjure --chatgpt "<image description>"')
+        print('Usage: conjure "<image description>"')
         sys.exit(1)
 
     prompt = " ".join(args)

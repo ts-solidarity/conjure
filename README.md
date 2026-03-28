@@ -15,9 +15,11 @@ This creates a Python venv, installs [cloakbrowser](https://pypi.org/project/clo
 ## Usage
 
 ```
-conjure --chatgpt "a samurai cat standing in the rain"
-conjure --gemini  "a robot reading a book in a cozy library"
+conjure "a samurai cat standing in the rain"
+conjure --gemini "a robot reading a book in a cozy library"
 ```
+
+Defaults to ChatGPT when no service flag is given. Use `--gemini` to switch.
 
 The image is saved as a PNG in your current directory, named from the prompt and timestamp (e.g. `a-samurai-cat-standing-in-the-rain-20260328-200143.png`).
 
