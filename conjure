@@ -183,16 +183,16 @@ def wait_for_images_stable(page, before_srcs, timeout=120):
     deadline = time.time() + timeout
 
     while time.time() < deadline:
+        page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         state = []
         for img in page.locator("img").all():
             try:
                 src = img.get_attribute("src") or ""
                 if src in before_srcs or src.startswith("data:image/svg"):
                     continue
-                box = img.bounding_box()
-                if not box or box["width"] < 100 or box["height"] < 100:
-                    continue
                 natural_w = img.evaluate("el => el.naturalWidth")
+                if natural_w < 100:
+                    continue
                 complete = img.evaluate("el => el.complete")
                 state.append((src, natural_w, complete))
             except Exception:
@@ -281,58 +281,34 @@ def save_image(page, img_element, filepath, service_name):
 
 def find_best_image(page, before_srcs):
     """Find the best new large image on the page."""
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
     candidates = []
     for img in page.locator("img").all():
         try:
             src = img.get_attribute("src") or ""
             if src in before_srcs or src.startswith("data:image/svg"):
                 continue
-            box = img.bounding_box()
-            if not box or box["width"] < 80 or box["height"] < 80:
-                continue
             natural_w = img.evaluate("el => el.naturalWidth")
             if natural_w < 512:
                 continue
-            candidates.append((img, box, natural_w))
+            candidates.append((img, src, natural_w))
         except Exception:
             continue
 
     if not candidates:
         return None
 
-    # Dedup by src
-    seen_srcs = {}
-    src_deduped = []
-    for img, box, nw in candidates:
-        src = img.get_attribute("src") or ""
-        if src in seen_srcs:
-            if nw > seen_srcs[src][2]:
-                src_deduped = [
-                    (i, b, n) if i.get_attribute("src") != src else (img, box, nw)
-                    for i, b, n in src_deduped
-                ]
-                seen_srcs[src] = (img, box, nw)
-        else:
-            seen_srcs[src] = (img, box, nw)
-            src_deduped.append((img, box, nw))
+    # Dedup by src — keep the element with the highest naturalWidth per URL
+    best_by_src = {}
+    for img, src, nw in candidates:
+        if src not in best_by_src or nw > best_by_src[src][1]:
+            best_by_src[src] = (img, nw)
 
-    # Dedup by proximity
-    final = []
-    for img, box, nw in src_deduped:
-        merged = False
-        for i, (fimg, fbox, fnw) in enumerate(final):
-            if abs(box["x"] - fbox["x"]) < 100 and abs(box["y"] - fbox["y"]) < 100:
-                if nw > fnw:
-                    final[i] = (img, box, nw)
-                merged = True
-                break
-        if not merged:
-            final.append((img, box, nw))
-
-    if not final:
+    if not best_by_src:
         return None
 
-    return max(final, key=lambda x: x[2])[0]
+    return max(best_by_src.values(), key=lambda x: x[1])[0]
 
 
 # ── Commands ──────────────────────────────────────────────────────
