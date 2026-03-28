@@ -10,7 +10,7 @@ cd conjure
 ./setup
 ```
 
-This creates a Python venv, installs [Playwright](https://playwright.dev/) + [cloakbrowser](https://pypi.org/project/cloakbrowser/) with Chromium, and symlinks `conjure` into `~/.local/bin/`.
+This creates a Python venv, installs [cloakbrowser](https://pypi.org/project/cloakbrowser/) (which bundles Playwright) with Chromium, and symlinks `conjure` into `~/.local/bin/`.
 
 ## Usage
 
