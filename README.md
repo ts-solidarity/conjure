@@ -21,6 +21,15 @@ conjure --gemini "a robot reading a book in a cozy library"
 
 Defaults to ChatGPT when no service flag is given. Use `--gemini` to switch.
 
+### Editing images
+
+Upload an existing image and describe how to change it:
+
+```
+conjure --edit photo.png "make the sky purple"
+conjure --gemini --edit photo.png "add a sunset in the background"
+```
+
 The image is saved as a PNG in your current directory, named from the prompt and timestamp (e.g. `a-samurai-cat-standing-in-the-rain-20260328-200143.png`).
 
 ### First run

@@ -30,6 +30,8 @@ SERVICES = {
         ],
         "login_sels": 'button:has-text("Log in"), a:has-text("Log in"), button:has-text("Sign up"), a:has-text("Sign up")',
         "prompt_prefix": "Generate an image: ",
+        "edit_prefix": "Edit this image: ",
+        "upload": lambda page, path: page.locator("input#upload-photos").set_input_files(str(path)),
     },
     "gemini": {
         "url": "https://gemini.google.com/app",
@@ -42,11 +44,21 @@ SERVICES = {
         "response_sel": "message-content",
         "login_sels": 'a:has-text("Sign in"), button:has-text("Sign in")',
         "prompt_prefix": "Generate an image of ",
+        "edit_prefix": "Edit this image: ",
+        "upload": lambda page, path: _gemini_upload(page, path),
     },
 }
 
 
 # ── Shared utilities ──────────────────────────────────────────────
+
+
+def _gemini_upload(page, path):
+    page.locator(".upload-card-button").click()
+    time.sleep(1)
+    with page.expect_file_chooser() as fc_info:
+        page.locator('button[data-test-id="local-images-files-uploader-button"]').click()
+    fc_info.value.set_files(str(path))
 
 
 def slugify(text: str, max_len: int = 40) -> str:
@@ -271,7 +283,7 @@ def find_best_image(page, before_srcs):
             if src in before_srcs or src.startswith("data:image/svg"):
                 continue
             box = img.bounding_box()
-            if not box or box["width"] < 150 or box["height"] < 150:
+            if not box or box["width"] < 80 or box["height"] < 80:
                 continue
             natural_w = img.evaluate("el => el.naturalWidth")
             if natural_w < 512:
@@ -335,11 +347,14 @@ def do_login(service_name):
         ctx.close()
 
 
-def do_generate(service_name, prompt):
+def do_generate(service_name, prompt, edit_image=None):
     svc = SERVICES[service_name]
     output_dir = Path.cwd()
 
-    print(f"Generating ({service_name}): {prompt}")
+    if edit_image:
+        print(f"Editing ({service_name}): {edit_image.name} — {prompt}")
+    else:
+        print(f"Generating ({service_name}): {prompt}")
 
     ctx, page = launch_browser(svc["profile"])
 
@@ -349,15 +364,18 @@ def do_generate(service_name, prompt):
 
         page.wait_for_selector(svc["input_sel"], timeout=15000)
 
-        # Snapshot current images
-        before_srcs = get_page_image_srcs(page)
+        # Upload image if editing
+        if edit_image:
+            svc["upload"](page, edit_image)
+            time.sleep(3)
 
         # Type prompt
         textarea = page.locator(svc["input_sel"])
         textarea.click()
         time.sleep(0.3)
 
-        full_prompt = svc["prompt_prefix"] + prompt
+        prefix = svc["edit_prefix"] if edit_image else svc["prompt_prefix"]
+        full_prompt = prefix + prompt
         try:
             textarea.fill(full_prompt)
         except Exception:
@@ -371,6 +389,10 @@ def do_generate(service_name, prompt):
             send.click()
         else:
             page.keyboard.press("Enter")
+
+        # Snapshot after send so the uploaded image's final URL is captured
+        time.sleep(3)
+        before_srcs = get_page_image_srcs(page)
 
         print("Waiting for image generation (this can take a minute)...")
 
@@ -408,6 +430,7 @@ def main():
     if not args or args[0] in ("-h", "--help"):
         print('Usage: conjure "<image description>"')
         print('       conjure --gemini "<image description>"')
+        print('       conjure --edit image.png "<edit instruction>"')
         print("       conjure --login [chatgpt|gemini]")
         print("")
         print("Defaults to chatgpt when no service is specified.")
@@ -431,12 +454,25 @@ def main():
     else:
         service = "chatgpt"
 
+    # Check for --edit flag
+    edit_image = None
+    if args and args[0] == "--edit":
+        args = args[1:]
+        if not args:
+            print("--edit requires an image path.")
+            sys.exit(1)
+        edit_image = Path(args[0]).resolve()
+        if not edit_image.is_file():
+            print(f"File not found: {edit_image}")
+            sys.exit(1)
+        args = args[1:]
+
     if not args:
         print('Usage: conjure "<image description>"')
         sys.exit(1)
 
     prompt = " ".join(args)
-    do_generate(service, prompt)
+    do_generate(service, prompt, edit_image=edit_image)
 
 
 if __name__ == "__main__":
