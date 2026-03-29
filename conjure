@@ -205,7 +205,7 @@ def wait_for_images(page, before_srcs, timeout=300):
     return False
 
 
-def save_image_via_download(page, img_element, filepath):
+def save_image_via_download_gemini(page, img_element, filepath):
     """Hover over image and click the native download button (Gemini)."""
     try:
         img_element.hover()
@@ -222,6 +222,38 @@ def save_image_via_download(page, img_element, filepath):
         filepath.unlink(missing_ok=True)
     except Exception:
         pass
+    return False
+
+
+def save_image_via_download_chatgpt(page, img_element, filepath):
+    """Click image to open modal, then click Save to download (ChatGPT)."""
+    try:
+        img_element.click()
+        time.sleep(2)
+        save_btn = page.locator('button:has-text("Save")').first
+        if not save_btn.is_visible():
+            page.keyboard.press("Escape")
+            return False
+        with page.expect_download(timeout=30000) as dl_info:
+            save_btn.click()
+        dl = dl_info.value
+        dl.save_as(str(filepath))
+        # Close the modal
+        time.sleep(1)
+        close = page.locator('button:has-text("Close")')
+        if close.count() > 0 and close.first.is_visible():
+            close.first.click()
+        else:
+            page.keyboard.press("Escape")
+        if filepath.stat().st_size > 1024:
+            return True
+        filepath.unlink(missing_ok=True)
+    except Exception:
+        # Close modal on failure
+        try:
+            page.keyboard.press("Escape")
+        except Exception:
+            pass
     return False
 
 
@@ -265,8 +297,11 @@ def save_image_via_fetch(page, img_element, filepath):
 
 
 def save_image(page, img_element, filepath, service_name):
-    if service_name == "gemini":
-        if save_image_via_download(page, img_element, filepath):
+    if service_name == "chatgpt":
+        if save_image_via_download_chatgpt(page, img_element, filepath):
+            return True
+    elif service_name == "gemini":
+        if save_image_via_download_gemini(page, img_element, filepath):
             return True
     return save_image_via_fetch(page, img_element, filepath)
 
