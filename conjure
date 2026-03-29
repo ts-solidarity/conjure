@@ -343,14 +343,14 @@ def do_generate(service_name, prompt, edit_image=None):
         else:
             page.keyboard.press("Enter")
 
-        # Snapshot after send so the uploaded image's final URL is captured
-        time.sleep(3)
-        before_srcs = get_page_image_srcs(page)
-
         print("Waiting for image generation (this can take a minute)...")
 
         if not wait_response_done(page, svc, timeout=180):
             print("Warning: timed out waiting for response.")
+
+        # Snapshot after response text is done — uploaded image has its final
+        # URL but edit result hasn't appeared yet
+        before_srcs = get_page_image_srcs(page)
 
         print("Waiting for image to finish rendering...")
         if not wait_for_images(page, before_srcs):
