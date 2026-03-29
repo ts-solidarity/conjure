@@ -264,6 +264,17 @@ def find_best_image(page, before_srcs):
             natural_w = img.evaluate("el => el.naturalWidth")
             if natural_w < 512:
                 continue
+            # Skip images inside the user's own message (uploaded original)
+            is_user_msg = img.evaluate("""el => {
+                let p = el;
+                while (p) {
+                    if (p.dataset && p.dataset.messageAuthorRole === 'user') return true;
+                    p = p.parentElement;
+                }
+                return false;
+            }""")
+            if is_user_msg:
+                continue
             candidates.append((img, src, natural_w))
         except Exception:
             continue
@@ -343,14 +354,13 @@ def do_generate(service_name, prompt, edit_image=None):
         else:
             page.keyboard.press("Enter")
 
+        # Snapshot before response — captures all existing image URLs
+        before_srcs = get_page_image_srcs(page)
+
         print("Waiting for image generation (this can take a minute)...")
 
         if not wait_response_done(page, svc, timeout=180):
             print("Warning: timed out waiting for response.")
-
-        # Snapshot after response text is done — uploaded image has its final
-        # URL but edit result hasn't appeared yet
-        before_srcs = get_page_image_srcs(page)
 
         print("Waiting for image to finish rendering...")
         if not wait_for_images(page, before_srcs):
