@@ -164,16 +164,17 @@ def wait_response_done(page, svc, timeout=180):
 
 
 def _is_ai_response_image(img):
-    """Check if an image is inside the AI's response (not the user's message)."""
+    """Check if an image is inside the AI's response (not the user's message).
+    Returns True unless the image is explicitly inside a user turn (ChatGPT).
+    Gemini has no data-turn attribute, so all images pass."""
     try:
         return img.evaluate("""el => {
             let p = el;
             while (p) {
-                if (p.dataset && p.dataset.turn === 'assistant') return true;
                 if (p.dataset && p.dataset.turn === 'user') return false;
                 p = p.parentElement;
             }
-            return false;
+            return true;
         }""")
     except Exception:
         return False
