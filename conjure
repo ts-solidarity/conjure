@@ -391,12 +391,24 @@ def main():
     args = sys.argv[1:]
 
     if not args or args[0] in ("-h", "--help"):
-        print('Usage: conjure "<image description>"')
-        print('       conjure --gemini "<image description>"')
-        print('       conjure --edit image.png "<edit instruction>"')
-        print("       conjure --login [chatgpt|gemini]")
+        print("conjure — generate and edit images via ChatGPT and Gemini")
         print("")
-        print("Defaults to chatgpt when no service is specified.")
+        print("Usage:")
+        print('  conjure "a cat in a top hat"          generate via chatgpt')
+        print('  conjure --gemini "a red panda"         generate via gemini')
+        print('  conjure --edit img.png "add sunset"    edit via chatgpt')
+        print('  conjure --gemini --edit img.png "..."  edit via gemini')
+        print('  conjure --login [chatgpt|gemini]       log in to a service')
+        print("")
+        print("Options:")
+        print("  --chatgpt   use ChatGPT (default)")
+        print("  --gemini    use Gemini")
+        print("  --edit      upload an image and edit it")
+        print("  --login     open a browser to log in (session is saved)")
+        print("  -h, --help  show this help")
+        print("")
+        print("Images are saved as PNGs in the current directory.")
+        print("First run: log in with 'conjure --login' before generating.")
         sys.exit(0)
 
     if args[0] == "--login":
