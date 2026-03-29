@@ -316,7 +316,10 @@ def do_login(service_name):
     except KeyboardInterrupt:
         print("\nCancelled.")
     finally:
-        ctx.close()
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 
 def do_generate(service_name, prompt, edit_image=None):
@@ -339,7 +342,12 @@ def do_generate(service_name, prompt, edit_image=None):
         # Upload image if editing
         if edit_image:
             svc["upload"](page, edit_image)
-            time.sleep(3)
+            # Wait for upload preview to appear (not a fixed delay)
+            try:
+                page.locator('img[src*="blob:"]').first.wait_for(timeout=30000)
+            except PlaywrightTimeout:
+                pass
+            time.sleep(1)
 
         # Type prompt
         textarea = page.locator(svc["input_sel"])
@@ -399,7 +407,10 @@ def do_generate(service_name, prompt, edit_image=None):
     except KeyboardInterrupt:
         print("\nCancelled.")
     finally:
-        ctx.close()
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 
 # ── CLI ───────────────────────────────────────────────────────────
