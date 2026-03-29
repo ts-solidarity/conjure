@@ -163,8 +163,23 @@ def wait_response_done(page, svc, timeout=180):
     return False
 
 
+def _is_user_message_image(img):
+    """Check if an image is inside the user's own message (not AI response)."""
+    try:
+        return img.evaluate("""el => {
+            let p = el;
+            while (p) {
+                if (p.dataset && p.dataset.messageAuthorRole === 'user') return true;
+                p = p.parentElement;
+            }
+            return false;
+        }""")
+    except Exception:
+        return False
+
+
 def wait_for_images(page, before_srcs, timeout=300):
-    """Wait until at least one new high-res image appears."""
+    """Wait until at least one new high-res AI-generated image appears."""
     deadline = time.time() + timeout
 
     while time.time() < deadline:
@@ -175,7 +190,7 @@ def wait_for_images(page, before_srcs, timeout=300):
                 if src in before_srcs or src.startswith("data:image/svg"):
                     continue
                 natural_w = img.evaluate("el => el.naturalWidth")
-                if natural_w >= 512:
+                if natural_w >= 512 and not _is_user_message_image(img):
                     time.sleep(5)
                     return True
             except Exception:
@@ -264,16 +279,7 @@ def find_best_image(page, before_srcs):
             natural_w = img.evaluate("el => el.naturalWidth")
             if natural_w < 512:
                 continue
-            # Skip images inside the user's own message (uploaded original)
-            is_user_msg = img.evaluate("""el => {
-                let p = el;
-                while (p) {
-                    if (p.dataset && p.dataset.messageAuthorRole === 'user') return true;
-                    p = p.parentElement;
-                }
-                return false;
-            }""")
-            if is_user_msg:
+            if _is_user_message_image(img):
                 continue
             candidates.append((img, src, natural_w))
         except Exception:
@@ -354,7 +360,7 @@ def do_generate(service_name, prompt, edit_image=None):
         else:
             page.keyboard.press("Enter")
 
-        # Snapshot before response — captures all existing image URLs
+        time.sleep(3)
         before_srcs = get_page_image_srcs(page)
 
         print("Waiting for image generation (this can take a minute)...")
