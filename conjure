@@ -1,6 +1,7 @@
 #!/home/fearth/Projects/conjure/.venv/bin/python3
 """Conjure images via ChatGPT or Gemini browser automation."""
 
+import argparse
 import sys
 import re
 import time
@@ -11,10 +12,12 @@ from datetime import datetime
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
     from cloakbrowser import launch_persistent_context as cloak_launch
-except ImportError:
-    print("Dependencies missing. Run setup first:")
-    print("  cd conjure && ./setup")
-    sys.exit(1)
+except ImportError as exc:
+    PlaywrightTimeout = TimeoutError
+    cloak_launch = None
+    IMPORT_ERROR = exc
+else:
+    IMPORT_ERROR = None
 
 CONFIG_DIR = Path.home() / ".config" / "conjure"
 
@@ -24,6 +27,10 @@ SERVICES = {
         "profile": CONFIG_DIR / "chatgpt-profile",
         "input_sel": "#prompt-textarea",
         "send_sel": 'button[data-testid="send-button"]',
+        "new_chat_sels": [
+            'a[data-testid="create-new-chat-button"]',
+            'a:has-text("New chat")',
+        ],
         "stop_sels": [
             'button[aria-label="Stop generating"]',
             'button[data-testid="stop-button"]',
@@ -38,6 +45,10 @@ SERVICES = {
         "profile": CONFIG_DIR / "gemini-profile",
         "input_sel": ".ql-editor",
         "send_sel": 'button[aria-label="Send message"]',
+        "new_chat_sels": [
+            'a[aria-label="New chat"]',
+            'a[href="/app"][aria-label="New chat"]',
+        ],
         "stop_sels": [
             'button[aria-label="Stop response"]',
         ],
@@ -79,7 +90,18 @@ def get_page_image_srcs(page) -> set:
     return srcs
 
 
+def require_runtime_dependencies():
+    if cloak_launch is not None:
+        return
+    print("Dependencies missing. Run setup first:")
+    print("  cd conjure && ./setup")
+    if IMPORT_ERROR:
+        print(f"Import error: {IMPORT_ERROR}")
+    sys.exit(1)
+
+
 def launch_browser(profile_dir, headless=True):
+    require_runtime_dependencies()
     profile_dir.mkdir(parents=True, exist_ok=True)
     ctx = cloak_launch(
         str(profile_dir),
@@ -120,6 +142,127 @@ def ensure_logged_in(page, svc, headless=True):
             time.sleep(1)
         print("Login timed out.")
         sys.exit(1)
+
+
+def get_prompt_text(page, svc):
+    field = page.locator(svc["input_sel"])
+    try:
+        return field.input_value()
+    except Exception:
+        pass
+    try:
+        return field.inner_text()
+    except Exception:
+        return ""
+
+
+def get_page_state(page, svc):
+    state = {
+        "url": page.url,
+        "user_turns": page.locator('[data-turn="user"]').count(),
+        "response_nodes": 0,
+        "image_srcs": get_page_image_srcs(page),
+        "prompt_text": get_prompt_text(page, svc),
+    }
+    response_sel = svc.get("response_sel")
+    if response_sel:
+        try:
+            state["response_nodes"] = page.locator(response_sel).count()
+        except Exception:
+            pass
+    return state
+
+
+def has_conversation_history(page, svc):
+    try:
+        if page.locator('[data-turn="user"]').count() > 0:
+            return True
+    except Exception:
+        pass
+
+    response_sel = svc.get("response_sel")
+    if response_sel:
+        try:
+            if page.locator(response_sel).count() > 0:
+                return True
+        except Exception:
+            pass
+
+    return False
+
+
+def wait_for_clean_chat(page, svc, timeout=20):
+    deadline = time.time() + timeout
+
+    while time.time() < deadline:
+        try:
+            page.wait_for_selector(svc["input_sel"], timeout=2000)
+        except PlaywrightTimeout:
+            pass
+
+        if not has_conversation_history(page, svc):
+            return True
+
+        time.sleep(1)
+
+    return False
+
+
+def ensure_fresh_chat(page, svc):
+    if wait_for_clean_chat(page, svc, timeout=3):
+        return
+
+    for sel in svc.get("new_chat_sels", []):
+        try:
+            button = page.locator(sel).first
+            if button.count() == 0 or not button.is_visible():
+                continue
+            button.click()
+            if wait_for_clean_chat(page, svc):
+                return
+        except Exception:
+            continue
+
+    # Fall back to reloading the service root once more in case the UI did not
+    # expose a fresh-chat control immediately.
+    try:
+        page.goto(svc["url"])
+    except Exception:
+        return
+    wait_for_clean_chat(page, svc)
+
+
+def wait_for_send_confirmation(page, svc, baseline, timeout=30):
+    deadline = time.time() + timeout
+    response_sel = svc.get("response_sel")
+
+    while time.time() < deadline:
+        try:
+            if page.locator('[data-turn="user"]').count() > baseline["user_turns"]:
+                return True
+        except Exception:
+            pass
+
+        if response_sel:
+            try:
+                if page.locator(response_sel).count() > baseline["response_nodes"]:
+                    return True
+            except Exception:
+                pass
+
+        try:
+            prompt_text = get_prompt_text(page, svc)
+            if baseline["prompt_text"].strip() and not prompt_text.strip():
+                return True
+        except Exception:
+            pass
+
+        if page.url != baseline["url"] and "/c/" in page.url:
+            return True
+
+        time.sleep(1)
+
+    return False
 
 
 def wait_response_done(page, svc, timeout=180):
@@ -374,6 +517,7 @@ def do_generate(service_name, prompt, edit_image=None):
     try:
         page.goto(svc["url"])
         ensure_logged_in(page, svc)
+        ensure_fresh_chat(page, svc)
 
         page.wait_for_selector(svc["input_sel"], timeout=15000)
 
@@ -400,6 +544,7 @@ def do_generate(service_name, prompt, edit_image=None):
             page.keyboard.type(full_prompt, delay=10)
 
         time.sleep(0.5)
+        baseline = get_page_state(page, svc)
 
         # Submit — wait for send button to be ready, then verify it went through
         send = page.locator(svc["send_sel"])
@@ -414,26 +559,8 @@ def do_generate(service_name, prompt, edit_image=None):
         else:
             page.keyboard.press("Enter")
 
-        # Verify message was sent (textarea clears, or conversation appears)
-        sent = False
-        for _ in range(30):
-            time.sleep(1)
-            # ChatGPT: URL changes or turn appears
-            if page.locator('[data-turn="user"]').count() > 0 or "/c/" in page.url:
-                sent = True
-                break
-            # Gemini: response content appears
-            if page.locator("message-content").count() > 0:
-                sent = True
-                break
-            # Both: textarea clears after send
-            try:
-                text = page.locator(svc["input_sel"]).inner_text()
-                if not text.strip():
-                    sent = True
-                    break
-            except Exception:
-                pass
+        # Verify message was sent relative to the pre-submit page state
+        sent = wait_for_send_confirmation(page, svc, baseline)
         if not sent:
             # Retry send
             send = page.locator(svc["send_sel"])
@@ -444,7 +571,7 @@ def do_generate(service_name, prompt, edit_image=None):
             time.sleep(10)
             sent = True  # best effort
 
-        before_srcs = get_page_image_srcs(page)
+        before_srcs = baseline["image_srcs"]
 
         print("Waiting for image generation (this can take a minute)...")
 
@@ -489,67 +616,80 @@ def do_generate(service_name, prompt, edit_image=None):
 # ── CLI ───────────────────────────────────────────────────────────
 
 
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="conjure",
+        description="Generate and edit images via ChatGPT and Gemini",
+        epilog=(
+            "Examples:\n"
+            '  conjure "a cat in a top hat"\n'
+            '  conjure --gemini "a red panda"\n'
+            '  conjure --edit img.png "add sunset"\n'
+            '  conjure --gemini --edit img.png "make it night"\n'
+            "  conjure --login gemini\n\n"
+            "Each run starts from a fresh chat before sending the prompt."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    service = parser.add_mutually_exclusive_group()
+    service.add_argument(
+        "--chatgpt",
+        dest="service",
+        action="store_const",
+        const="chatgpt",
+        help="use ChatGPT (default)",
+    )
+    service.add_argument(
+        "--gemini",
+        dest="service",
+        action="store_const",
+        const="gemini",
+        help="use Gemini",
+    )
+    parser.set_defaults(service="chatgpt")
+    parser.add_argument(
+        "--edit",
+        metavar="IMAGE",
+        type=Path,
+        help="upload an image and edit it",
+    )
+    parser.add_argument(
+        "--login",
+        nargs="?",
+        const="",
+        metavar="SERVICE",
+        help="open a browser to log in and save the session",
+    )
+    parser.add_argument(
+        "prompt",
+        nargs="*",
+        help="image prompt",
+    )
+    return parser
+
+
 def main():
-    args = sys.argv[1:]
+    parser = build_parser()
+    args = parser.parse_args()
 
-    if not args or args[0] in ("-h", "--help"):
-        print("conjure — generate and edit images via ChatGPT and Gemini")
-        print("")
-        print("Usage:")
-        print('  conjure "a cat in a top hat"          generate via chatgpt')
-        print('  conjure --gemini "a red panda"         generate via gemini')
-        print('  conjure --edit img.png "add sunset"    edit via chatgpt')
-        print('  conjure --gemini --edit img.png "..."  edit via gemini')
-        print('  conjure --login [chatgpt|gemini]       log in to a service')
-        print("")
-        print("Options:")
-        print("  --chatgpt   use ChatGPT (default)")
-        print("  --gemini    use Gemini")
-        print("  --edit      upload an image and edit it")
-        print("  --login     open a browser to log in (session is saved)")
-        print("  -h, --help  show this help")
-        print("")
-        print("Images are saved as PNGs in the current directory.")
-        print("First run: log in with 'conjure --login' before generating.")
-        sys.exit(0)
-
-    if args[0] == "--login":
-        service = args[1] if len(args) > 1 else "chatgpt"
+    if args.login is not None:
+        service = args.login or args.service
         if service not in SERVICES:
-            print(f"Unknown service: {service}. Use: chatgpt, gemini")
-            sys.exit(1)
+            parser.error(f"unknown service: {service}. Use: chatgpt or gemini")
         do_login(service)
-        sys.exit(0)
+        return
 
-    # Determine service from flag (default: chatgpt)
-    if args[0] == "--chatgpt":
-        service = "chatgpt"
-        args = args[1:]
-    elif args[0] == "--gemini":
-        service = "gemini"
-        args = args[1:]
-    else:
-        service = "chatgpt"
-
-    # Check for --edit flag
     edit_image = None
-    if args and args[0] == "--edit":
-        args = args[1:]
-        if not args:
-            print("--edit requires an image path.")
-            sys.exit(1)
-        edit_image = Path(args[0]).resolve()
+    if args.edit is not None:
+        edit_image = args.edit.resolve()
         if not edit_image.is_file():
-            print(f"File not found: {edit_image}")
-            sys.exit(1)
-        args = args[1:]
+            parser.error(f"file not found: {edit_image}")
 
-    if not args:
-        print('Usage: conjure "<image description>"')
-        sys.exit(1)
+    prompt = " ".join(args.prompt).strip()
+    if not prompt:
+        parser.error('the prompt is required unless "--login" is used')
 
-    prompt = " ".join(args)
-    do_generate(service, prompt, edit_image=edit_image)
+    do_generate(args.service, prompt, edit_image=edit_image)
 
 
 if __name__ == "__main__":

@@ -20,6 +20,7 @@ conjure --gemini "a robot reading a book in a cozy library"
 ```
 
 Defaults to ChatGPT when no service flag is given. Use `--gemini` to switch.
+Each run starts from a fresh chat so old conversation state does not interfere with image detection.
 
 ### Editing images
 
