@@ -2,12 +2,17 @@
 """Conjure images via ChatGPT or Gemini browser automation."""
 
 import argparse
+import os
 import sys
 import re
 import time
 import base64
 from pathlib import Path
 from datetime import datetime
+
+# Cloakbrowser emits update notices during normal runs. Default them off so the
+# CLI output stays focused, while still allowing an explicit env override.
+os.environ.setdefault("CLOAKBROWSER_AUTO_UPDATE", "false")
 
 try:
     from playwright.sync_api import TimeoutError as PlaywrightTimeout
@@ -32,7 +37,6 @@ SERVICES = {
             'a:has-text("New chat")',
         ],
         "stop_sels": [
-            'button[aria-label="Stop generating"]',
             'button[data-testid="stop-button"]',
         ],
         "login_sels": 'button:has-text("Log in"), a:has-text("Log in"), button:has-text("Sign up"), a:has-text("Sign up")',
@@ -59,6 +63,79 @@ SERVICES = {
         "upload": lambda page, path: _gemini_upload(page, path),
     },
 }
+
+
+# ── Failure detection ────────────────────────────────────────────
+#
+# When ChatGPT or Gemini cannot fulfill the request (quota hit, content
+# policy refusal, internal error) they reply with text only — no image.
+# Without these checks the CLI would hang for the full image-wait timeout
+# (~5 minutes) before reporting a generic "No image found".
+
+QUOTA_PATTERNS = [
+    r"hit the free plan limit",
+    r"reached your image creation limit",
+    r"image creation limit",
+    r"limit resets in",
+    r"try again tomorrow",
+]
+
+ERROR_PATTERNS = [
+    r"\bsomething went wrong\b",
+    r"unable to generate",
+    r"error generating",
+    r"can'?t (?:create|generate|make|produce) (?:that|this|the|an? )?image",
+    r"wasn'?t able to (?:create|generate|make)",
+    r"this (?:request|content) (?:may )?violate",
+    r"violates? (?:our )?(?:content )?polic",
+    r"can'?t help with that request",
+]
+
+
+class ServiceFailure(Exception):
+    """Raised when the service returns a text-only refusal/error instead of an image."""
+
+    def __init__(self, reason: str, message: str):
+        self.reason = reason
+        self.message = message
+        super().__init__(f"{reason}: {message[:120]}")
+
+
+def _latest_assistant_text(page, svc) -> str:
+    response_sel = svc.get("response_sel")
+    try:
+        if response_sel:
+            return page.evaluate(
+                """(sel) => {
+                    const els = document.querySelectorAll(sel);
+                    if (!els.length) return '';
+                    return (els[els.length - 1].innerText || '').trim();
+                }""",
+                response_sel,
+            )
+        return page.evaluate(
+            """() => {
+                const turns = document.querySelectorAll('[data-turn="assistant"]');
+                if (!turns.length) return '';
+                return (turns[turns.length - 1].innerText || '').trim();
+            }"""
+        )
+    except Exception:
+        return ""
+
+
+def check_for_failure(page, svc):
+    """Raise ServiceFailure if the latest assistant message indicates the request failed."""
+    text = _latest_assistant_text(page, svc)
+    if not text:
+        return
+    low = text.lower()
+    for pat in QUOTA_PATTERNS:
+        if re.search(pat, low):
+            raise ServiceFailure("quota", text)
+    for pat in ERROR_PATTERNS:
+        if re.search(pat, low):
+            raise ServiceFailure("error", text)
 
 
 # ── Shared utilities ──────────────────────────────────────────────
@@ -273,6 +350,11 @@ def wait_response_done(page, svc, timeout=180):
     stable_since = None
 
     while time.time() < deadline:
+        # If the assistant already replied with a refusal/quota message,
+        # raise so the caller can stop waiting for an image that will
+        # never arrive.
+        check_for_failure(page, svc)
+
         # Stop button detection
         generating = any(
             page.locator(sel).count() > 0 for sel in svc["stop_sels"]
@@ -326,11 +408,12 @@ def _is_ai_response_image(img):
         return False
 
 
-def wait_for_images(page, before_srcs, timeout=300):
+def wait_for_images(page, before_srcs, svc, timeout=300):
     """Wait until at least one new high-res AI-generated image appears."""
     deadline = time.time() + timeout
 
     while time.time() < deadline:
+        check_for_failure(page, svc)
         page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
         for img in page.locator("img").all():
             try:
@@ -579,7 +662,7 @@ def do_generate(service_name, prompt, edit_image=None):
             print("Warning: timed out waiting for response.")
 
         print("Waiting for image to finish rendering...")
-        if not wait_for_images(page, before_srcs):
+        if not wait_for_images(page, before_srcs, svc):
             print("Warning: images may not be fully rendered.")
 
         # Find and save the best image
@@ -593,6 +676,10 @@ def do_generate(service_name, prompt, edit_image=None):
             # Retry — image may still be loading
             for _ in range(3):
                 time.sleep(10)
+                try:
+                    check_for_failure(page, svc)
+                except ServiceFailure:
+                    raise
                 best = find_best_image(page, before_srcs)
                 if best:
                     break
@@ -600,10 +687,33 @@ def do_generate(service_name, prompt, edit_image=None):
         if best and save_image(page, best, filepath, service_name):
             print(f"Saved: {filepath}")
         else:
+            assistant_text = _latest_assistant_text(page, svc)
+            if assistant_text:
+                print(
+                    f"No image in response. {service_name} replied with text:\n  "
+                    + assistant_text.replace("\n", "\n  ")
+                )
             debug = output_dir / f"{slug}-{timestamp}-debug.png"
             page.screenshot(path=str(debug), full_page=True)
-            print(f"No image found in response. Debug screenshot: {debug}")
+            print(f"Debug screenshot: {debug}")
 
+    except ServiceFailure as exc:
+        # Let the assistant finish streaming before snapshotting the reply,
+        # otherwise the printed message may be truncated mid-word.
+        try:
+            time.sleep(2)
+            final_text = _latest_assistant_text(page, svc) or exc.message
+        except Exception:
+            final_text = exc.message
+        label = {
+            "quota": "image quota reached",
+            "error": "could not generate image",
+        }.get(exc.reason, exc.reason)
+        print(
+            f"\n{service_name}: {label}. Response:\n  "
+            + final_text.replace("\n", "\n  ")
+        )
+        sys.exit(2)
     except KeyboardInterrupt:
         print("\nCancelled.")
     finally:
