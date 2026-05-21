@@ -452,30 +452,36 @@ def save_image_via_download_gemini(page, img_element, filepath):
 
 
 def save_image_via_download_chatgpt(page, img_element, filepath):
-    """Click image to open modal, then click Save to download (ChatGPT)."""
+    """Open the fullscreen image viewer and trigger its Save action.
+
+    The Save and Close controls are icon-only buttons identified by their
+    aria-label; matching them via :has-text() never resolves because they
+    have no visible text.
+    """
     try:
         img_element.click()
-        time.sleep(2)
-        save_btn = page.locator('button:has-text("Save")').first
-        if not save_btn.is_visible():
+        save_btn = page.locator('[role="dialog"] button[aria-label="Save"]').first
+        try:
+            save_btn.wait_for(state="visible", timeout=10000)
+        except PlaywrightTimeout:
             page.keyboard.press("Escape")
             return False
         with page.expect_download(timeout=30000) as dl_info:
             save_btn.click()
         dl = dl_info.value
         dl.save_as(str(filepath))
-        # Close the modal
-        time.sleep(1)
-        close = page.locator('button:has-text("Close")')
-        if close.count() > 0 and close.first.is_visible():
-            close.first.click()
-        else:
+        try:
+            close = page.locator('button[aria-label="Close fullscreen view"]').first
+            if close.is_visible():
+                close.click()
+            else:
+                page.keyboard.press("Escape")
+        except Exception:
             page.keyboard.press("Escape")
         if filepath.stat().st_size > 1024:
             return True
         filepath.unlink(missing_ok=True)
     except Exception:
-        # Close modal on failure
         try:
             page.keyboard.press("Escape")
         except Exception:
