@@ -70,6 +70,18 @@ conjure image --chatgpt "a samurai cat standing in the rain"
 
 > Note: `conjure image`'s **Gemini** path (the default) is currently unreliable — prefer asking in a chat for Gemini image generation. The command works with `--chatgpt`.
 
+## Web UI
+
+`conjure serve` launches a local chat **web UI** (plus the API below) over one warm browser session:
+
+```
+conjure serve            # then open http://127.0.0.1:8765 in your browser
+```
+
+A Gemini-shaped interface — a sidebar of your conversations, open / continue / new chats, messages and inline images, and an API-keys panel. It talks to the same-origin API; localhost is trusted, so the UI needs no key.
+
+> Not yet wired: model selection, extended thinking, and streaming. These require driving Gemini's own in-page controls (the model picker, etc.) through the warm browser — a planned follow-up, now looking feasible since those controls are reachable.
+
 ## API server
 
 Run conjure as a small **local HTTP API** over a single *warm* browser session — one Chromium launch, reused for every request (no per-call cold start). You mint conjure's own API keys; clients use them to talk to your Gemini subscription.

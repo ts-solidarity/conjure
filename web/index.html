@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>conjure</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,600;9..144,900&family=Hanken+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <aside class="sidebar">
+      <div class="brand">
+        <span class="brand-mark">✦</span>
+        <span class="brand-word">conjure</span>
+      </div>
+
+      <button id="new-chat" class="new-chat">
+        <span class="plus">+</span> New chat
+      </button>
+
+      <div class="recents">
+        <div class="recents-head">Recents</div>
+        <nav id="chat-list" class="chat-list" aria-label="Conversations"></nav>
+      </div>
+
+      <div class="sidebar-foot">
+        <button id="open-keys" class="ghost-btn">◇ API keys</button>
+        <span id="conn" class="conn" title="server connection">●</span>
+      </div>
+    </aside>
+
+    <main class="stage">
+      <header class="stage-head">
+        <h1 id="thread-title">New chat</h1>
+        <span id="thread-sub" class="thread-sub">Gemini · subscription</span>
+      </header>
+
+      <div id="thread" class="thread"></div>
+
+      <div class="composer-wrap">
+        <form id="composer" class="composer">
+          <textarea id="input" rows="1" placeholder="Conjure something…" autocomplete="off"></textarea>
+          <button id="send" type="submit" aria-label="Send" disabled>
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path d="M5 12h14M13 6l6 6-6 6" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </form>
+        <p class="composer-hint">conjure drives your real Gemini session · replies take a few seconds</p>
+      </div>
+    </main>
+  </div>
+
+  <!-- API keys drawer -->
+  <div id="keys-modal" class="modal hidden" role="dialog" aria-modal="true" aria-label="API keys">
+    <div class="modal-card">
+      <div class="modal-head">
+        <h2>API keys</h2>
+        <button id="keys-close" class="icon-btn" aria-label="Close">✕</button>
+      </div>
+      <p class="modal-note">Keys are for <em>external</em> clients calling conjure. This local UI needs none. Shown once on creation.</p>
+      <form id="key-create" class="key-create">
+        <input id="key-label" type="text" placeholder="label (e.g. my-bot)" />
+        <button type="submit" class="solid-btn">Mint key</button>
+      </form>
+      <div id="key-reveal" class="key-reveal hidden"></div>
+      <ul id="key-list" class="key-list"></ul>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden"></div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

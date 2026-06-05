@@ -1375,6 +1375,28 @@ def do_chat(message, continue_id=None):
             pass
 
 
+def _open_sidebar(page):
+    """Open Gemini's side nav so the Recents conversation list is in the DOM.
+    Gemini collapses the nav by default; when collapsed there are no
+    conversation links to scrape."""
+    try:
+        if page.locator('a[href*="/app/"]').count() > 0:
+            return  # already open
+        btn = page.locator(
+            'button[aria-label="Open sidebar"], [data-test-id="side-nav-sparkle-button"]'
+        ).first
+        if btn.count() and btn.is_visible():
+            btn.click()
+            time.sleep(1.5)
+        if page.locator('a[href*="/app/"]').count() == 0:
+            rec = page.locator('button[aria-label="Toggle Recents"]').first
+            if rec.count() and rec.is_visible():
+                rec.click()
+                time.sleep(1.5)
+    except Exception as exc:
+        debug(f"_open_sidebar failed: {exc}")
+
+
 def _scrape_conversations(page, svc, limit=30):
     """Scrape (id, title) pairs from the Gemini sidebar conversation links."""
     out = []
@@ -1403,6 +1425,93 @@ def _scrape_conversations(page, svc, limit=30):
     return out
 
 
+def _fetch_image_b64(page, src):
+    """Fetch an image URL through the page (uses session cookies); return base64."""
+    if not src or src.startswith("data:image/svg"):
+        return None
+    try:
+        return page.evaluate(
+            """async (src) => {
+                const resp = await fetch(src);
+                const blob = await resp.blob();
+                return await new Promise((resolve) => {
+                    const r = new FileReader();
+                    r.onloadend = () => resolve((r.result || '').split(',')[1] || '');
+                    r.readAsDataURL(blob);
+                });
+            }""",
+            src,
+        )
+    except Exception as exc:
+        debug(f"_fetch_image_b64 failed: {exc}")
+        return None
+
+
+def _scrape_transcript(page, svc, max_images=12):
+    """Extract the ordered transcript of the CURRENT conversation as a list of
+    {role, text, images} messages. Gemini doesn't tag user turns, so we walk
+    .conversation-container (each holds one user query + one model response),
+    stripping the 'You said ' a11y prefix and the source-citation chips."""
+    # Nudge lazy-loaded images into the DOM. The chat scrolls inside a container
+    # (not the window), so scroll each turn into view rather than the page.
+    try:
+        page.evaluate("""() => {
+            document.querySelectorAll('.conversation-container').forEach(c => {
+                try { c.scrollIntoView(); } catch (e) {}
+            });
+        }""")
+        time.sleep(1.5)
+    except Exception:
+        pass
+
+    raw = page.evaluate(
+        r"""(chipSel) => {
+            const strip = (el) => {
+                if (!el) return '';
+                const chips = el.querySelectorAll(chipSel);
+                const prev = [];
+                chips.forEach(e => { prev.push(e.style.display); e.style.display = 'none'; });
+                let t = '';
+                try { t = (el.innerText || '').trim(); }
+                finally { chips.forEach((e, i) => { e.style.display = prev[i] || ''; }); }
+                return t;
+            };
+            return Array.from(document.querySelectorAll('.conversation-container')).map(c => {
+                const q = c.querySelector('.query-text')
+                    || c.querySelector('user-query-content') || c.querySelector('user-query');
+                let user = q ? (q.innerText || '').trim() : '';
+                user = user.replace(/^You said\s*/i, '').trim();
+                const model = strip(c.querySelector('message-content'));
+                const srcs = Array.from(c.querySelectorAll('img'))
+                    .filter(im => (im.naturalWidth || 0) >= 512)
+                    .map(im => im.src)
+                    .filter(s => s && !s.startsWith('data:image/svg'));
+                return { user, model, srcs };
+            });
+        }""",
+        _SOURCE_CHIP_SEL,
+    )
+
+    messages = []
+    seen_src = set()
+    budget = max_images
+    for turn in raw:
+        if turn.get("user"):
+            messages.append({"role": "user", "text": turn["user"], "images": []})
+        imgs = []
+        for src in turn.get("srcs", []):
+            if budget <= 0 or src in seen_src:
+                continue
+            seen_src.add(src)
+            b64 = _fetch_image_b64(page, src)
+            if b64:
+                imgs.append(b64)
+                budget -= 1
+        if turn.get("model") or imgs:
+            messages.append({"role": "assistant", "text": turn.get("model", ""), "images": imgs})
+    return messages
+
+
 def do_list_chats():
     """List recent Gemini conversations scraped from the sidebar."""
     svc = SERVICES["gemini"]
@@ -1410,7 +1519,8 @@ def do_list_chats():
     try:
         page.goto(svc["url"])
         ensure_logged_in(page, svc)
-        time.sleep(3)  # let the sidebar populate
+        _open_sidebar(page)  # nav is collapsed by default
+        time.sleep(1)
         convos = _scrape_conversations(page, svc)
         if not convos:
             print("No conversations found in the sidebar.")
@@ -1471,25 +1581,41 @@ def _save_api_keys(keys):
         pass
 
 
+def _create_api_key(label=None):
+    """Mint a new API key. Returns (raw_token, entry); only the hash is stored."""
+    keys = _load_api_keys()
+    raw = "cjr_" + secrets.token_hex(24)
+    entry = {
+        "label": label or "key",
+        "prefix": raw[:12],
+        "hash": _hash_key(raw),
+        "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    keys.append(entry)
+    _save_api_keys(keys)
+    return raw, entry
+
+
+def _revoke_api_key(label):
+    """Revoke keys matching a label or prefix. Returns the count removed."""
+    keys = _load_api_keys()
+    kept = [k for k in keys
+            if label not in (k["label"], k["prefix"]) and not k["prefix"].startswith(label)]
+    _save_api_keys(kept)
+    return len(keys) - len(kept)
+
+
 def do_key(action, label=None):
     """Manage conjure's own API keys. Only a SHA-256 hash is stored; the raw
     token is shown once at creation."""
-    keys = _load_api_keys()
     if action == "new":
-        raw = "cjr_" + secrets.token_hex(24)
-        entry = {
-            "label": label or "key",
-            "prefix": raw[:12],
-            "hash": _hash_key(raw),
-            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        }
-        keys.append(entry)
-        _save_api_keys(keys)
+        raw, entry = _create_api_key(label)
         print("New API key — shown once, store it now:\n")
         print(f"    {raw}\n")
         print(f"  label={entry['label']}  prefix={entry['prefix']}")
         return 0
     if action == "list":
+        keys = _load_api_keys()
         if not keys:
             print("No API keys yet. Create one: conjure key new [label]")
             return 0
@@ -1501,17 +1627,26 @@ def do_key(action, label=None):
         if not label:
             print("Usage: conjure key revoke <label-or-prefix>")
             return 1
-        kept = [k for k in keys
-                if label not in (k["label"], k["prefix"]) and not k["prefix"].startswith(label)]
-        _save_api_keys(kept)
-        print(f"Revoked {len(keys) - len(kept)} key(s).")
+        print(f"Revoked {_revoke_api_key(label)} key(s).")
         return 0
     print(f"Unknown key action: {action}")
     return 1
 
 
+WEB_DIR = Path(__file__).resolve().parent / "web"
+_CONTENT_TYPES = {
+    ".html": "text/html; charset=utf-8", ".css": "text/css",
+    ".js": "application/javascript", ".svg": "image/svg+xml",
+    ".png": "image/png", ".ico": "image/x-icon", ".woff2": "font/woff2",
+    ".json": "application/json",
+}
+
+
 class _APIHandler(BaseHTTPRequestHandler):
-    """Native conjure API over a warm Gemini browser session."""
+    """Native conjure API + static UI over a warm Gemini browser session.
+
+    Localhost requests are trusted (the local UI needs no key); the keys minted
+    here are for external clients. Key management is localhost-only."""
 
     def log_message(self, fmt, *args):
         debug("http: " + (fmt % args))
@@ -1524,37 +1659,122 @@ class _APIHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _send_bytes(self, code, body, content_type):
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _is_local(self):
+        host = self.client_address[0] if self.client_address else ""
+        return host in ("127.0.0.1", "::1", "localhost")
+
     def _authorized(self):
+        # Localhost (the UI) is trusted; external clients need a valid key.
+        if self._is_local():
+            return True
         auth = self.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
             return False
         return _hash_key(auth[7:].strip()) in self.server.key_hashes
 
+    def _refresh_keys(self):
+        self.server.key_hashes = {k["hash"] for k in _load_api_keys()}
+
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            return json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return None
+
+    def _serve_static(self, path):
+        rel = "index.html" if path in ("", "/") else path.lstrip("/")
+        try:
+            target = (WEB_DIR / rel).resolve()
+            target.relative_to(WEB_DIR)  # reject path traversal
+        except (ValueError, OSError):
+            return self._send(404, {"error": "not found"})
+        if not target.is_file():
+            return self._send(404, {"error": "not found (build the web/ UI)"})
+        self._send_bytes(200, target.read_bytes(),
+                         _CONTENT_TYPES.get(target.suffix, "application/octet-stream"))
+
     def do_GET(self):
         path = self.path.split("?")[0]
         if path == "/health":
             return self._send(200, {"ok": True, "service": "gemini"})
+
+        # Anything that isn't an API route is a static UI asset (no auth needed).
+        if not path.startswith(("/chat", "/chats", "/keys")):
+            return self._serve_static(path)
+
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
+
         if path == "/chats":
+            page, svc = self.server.page, self.server.svc
             try:
-                convos = _scrape_conversations(self.server.page, self.server.svc)
+                page.goto(svc["url"])
+                _open_sidebar(page)  # nav is collapsed by default
+                try:
+                    page.wait_for_selector(svc["chats_sel"], timeout=8000)
+                except Exception:
+                    pass
+                time.sleep(0.5)
+                convos = _scrape_conversations(page, svc)
                 return self._send(200, {"conversations": [{"id": i, "title": t} for i, t in convos]})
             except Exception as exc:
                 debug(f"/chats error: {exc!r}")
                 return self._send(500, {"error": str(exc)})
+
+        mc = re.match(r"^/chats/([0-9a-fA-F]{6,})$", path)
+        if mc:
+            conv_id = mc.group(1)
+            page, svc = self.server.page, self.server.svc
+            try:
+                page.goto(f"{svc['url'].rstrip('/')}/{conv_id}")
+                try:
+                    page.wait_for_selector("message-content", timeout=20000)
+                except Exception:
+                    pass
+                time.sleep(1.5)
+                return self._send(200, {"conversation_id": conv_id,
+                                        "messages": _scrape_transcript(page, svc)})
+            except Exception as exc:
+                debug(f"/chats/{conv_id} error: {exc!r}")
+                return self._send(500, {"error": str(exc)})
+
+        if path == "/keys":
+            if not self._is_local():
+                return self._send(403, {"error": "key management is localhost-only"})
+            keys = [{"label": k["label"], "prefix": k["prefix"], "created": k.get("created")}
+                    for k in _load_api_keys()]
+            return self._send(200, {"keys": keys})
+
         return self._send(404, {"error": "not found"})
 
     def do_POST(self):
         path = self.path.split("?")[0]
         if not self._authorized():
             return self._send(401, {"error": "unauthorized"})
+
+        if path == "/keys":
+            if not self._is_local():
+                return self._send(403, {"error": "key management is localhost-only"})
+            body = self._read_json()
+            if body is None:
+                return self._send(400, {"error": "invalid JSON body"})
+            raw, entry = _create_api_key((body.get("label") or "key").strip() or "key")
+            self._refresh_keys()
+            return self._send(200, {"key": raw, "label": entry["label"],
+                                    "prefix": entry["prefix"], "created": entry["created"]})
+
         if path != "/chat":
             return self._send(404, {"error": "not found"})
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        try:
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
+        body = self._read_json()
+        if body is None:
             return self._send(400, {"error": "invalid JSON body"})
         message = (body.get("message") or "").strip()
         if not message:
@@ -1583,16 +1803,24 @@ class _APIHandler(BaseHTTPRequestHandler):
             "images": [base64.b64encode(d).decode() for d in result["images"]],
         })
 
+    def do_DELETE(self):
+        path = self.path.split("?")[0]
+        md = re.match(r"^/keys/(.+)$", path)
+        if not md:
+            return self._send(404, {"error": "not found"})
+        if not self._is_local():
+            return self._send(403, {"error": "key management is localhost-only"})
+        n = _revoke_api_key(md.group(1))
+        self._refresh_keys()
+        return self._send(200, {"revoked": n})
+
 
 def do_serve(host, port):
-    """Run the local API server over one warm Gemini browser session."""
+    """Run the local API server + web UI over one warm Gemini browser session."""
     svc = SERVICES["gemini"]
     keys = _load_api_keys()
-    if not keys:
-        print("No API keys yet — create one first:  conjure key new")
-        return 1
 
-    print(f"Starting conjure API server — launching warm browser ({svc['url']}) ...")
+    print(f"Starting conjure server — launching warm browser ({svc['url']}) ...")
     ctx, page = launch_browser(svc["profile"])
     try:
         page.goto(svc["url"])
@@ -1617,10 +1845,10 @@ def do_serve(host, port):
         server.last_op = 0.0
         server.min_interval = 1.5
 
-        print(f"Listening on http://{host}:{port}  ({len(keys)} key(s) active)")
-        print('  POST /chat   {"message": "...", "conversation_id": "<optional>"}')
-        print("  GET  /chats   ·   GET /health")
-        print("Ctrl+C to stop.")
+        print(f"\n  conjure → http://{host}:{port}   (open this in your browser)")
+        print(f"  API: POST /chat · GET /chats · GET /chats/<id> · /keys   "
+              f"({len(keys)} key(s) for external clients)")
+        print("  Localhost is trusted (no key needed); Ctrl+C to stop.\n")
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
