@@ -1425,90 +1425,71 @@ def _scrape_conversations(page, svc, limit=30):
     return out
 
 
-def _fetch_image_b64(page, src):
-    """Fetch an image URL through the page (uses session cookies); return base64."""
-    if not src or src.startswith("data:image/svg"):
-        return None
+def _scrape_transcript(page, svc, max_images=8):
+    """Extract the ordered transcript of the CURRENT conversation as a list of
+    {role, text, images} messages. Walks .conversation-container (each holds one
+    user query + one model response), stripping the 'You said ' a11y prefix and
+    the source-citation chips.
+
+    Generated images are lazy (loading=lazy, blob: src, not decoded until in
+    view) and their blob URLs aren't fetchable, so each AI-generated image
+    (alt='…AI generated') is scrolled to centre to force-decode it, then
+    captured via canvas. Done in one async evaluate to avoid per-image round
+    trips."""
     try:
-        return page.evaluate(
-            """async (src) => {
-                const resp = await fetch(src);
-                const blob = await resp.blob();
-                return await new Promise((resolve) => {
-                    const r = new FileReader();
-                    r.onloadend = () => resolve((r.result || '').split(',')[1] || '');
-                    r.readAsDataURL(blob);
-                });
+        raw = page.evaluate(
+            r"""async ([chipSel, maxImages]) => {
+                const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+                const strip = (el) => {
+                    if (!el) return '';
+                    const chips = el.querySelectorAll(chipSel);
+                    const prev = [];
+                    chips.forEach((e) => { prev.push(e.style.display); e.style.display = 'none'; });
+                    let t = '';
+                    try { t = (el.innerText || '').trim(); }
+                    finally { chips.forEach((e, i) => { e.style.display = prev[i] || ''; }); }
+                    return t;
+                };
+                let budget = maxImages;
+                const out = [];
+                for (const c of document.querySelectorAll('.conversation-container')) {
+                    const q = c.querySelector('.query-text')
+                        || c.querySelector('user-query-content') || c.querySelector('user-query');
+                    let user = q ? (q.innerText || '').trim() : '';
+                    user = user.replace(/^You said\s*/i, '').trim();
+                    const model = strip(c.querySelector('message-content'));
+                    const images = [];
+                    for (const im of c.querySelectorAll('img[alt*="AI generated"]')) {
+                        if (budget <= 0) break;
+                        try { im.scrollIntoView({ block: 'center' }); } catch (e) {}
+                        let tries = 0;
+                        while (!im.naturalWidth && tries < 20) { await sleep(300); tries++; }
+                        if (!im.naturalWidth) continue;
+                        try {
+                            const cv = document.createElement('canvas');
+                            cv.width = im.naturalWidth; cv.height = im.naturalHeight;
+                            cv.getContext('2d').drawImage(im, 0, 0);
+                            const b64 = (cv.toDataURL('image/png').split(',')[1]) || '';
+                            if (b64) { images.push(b64); budget--; }
+                        } catch (e) {}
+                    }
+                    out.push({ user, model, images });
+                }
+                return out;
             }""",
-            src,
+            [_SOURCE_CHIP_SEL, max_images],
         )
     except Exception as exc:
-        debug(f"_fetch_image_b64 failed: {exc}")
-        return None
-
-
-def _scrape_transcript(page, svc, max_images=12):
-    """Extract the ordered transcript of the CURRENT conversation as a list of
-    {role, text, images} messages. Gemini doesn't tag user turns, so we walk
-    .conversation-container (each holds one user query + one model response),
-    stripping the 'You said ' a11y prefix and the source-citation chips."""
-    # Nudge lazy-loaded images into the DOM. The chat scrolls inside a container
-    # (not the window), so scroll each turn into view rather than the page.
-    try:
-        page.evaluate("""() => {
-            document.querySelectorAll('.conversation-container').forEach(c => {
-                try { c.scrollIntoView(); } catch (e) {}
-            });
-        }""")
-        time.sleep(1.5)
-    except Exception:
-        pass
-
-    raw = page.evaluate(
-        r"""(chipSel) => {
-            const strip = (el) => {
-                if (!el) return '';
-                const chips = el.querySelectorAll(chipSel);
-                const prev = [];
-                chips.forEach(e => { prev.push(e.style.display); e.style.display = 'none'; });
-                let t = '';
-                try { t = (el.innerText || '').trim(); }
-                finally { chips.forEach((e, i) => { e.style.display = prev[i] || ''; }); }
-                return t;
-            };
-            return Array.from(document.querySelectorAll('.conversation-container')).map(c => {
-                const q = c.querySelector('.query-text')
-                    || c.querySelector('user-query-content') || c.querySelector('user-query');
-                let user = q ? (q.innerText || '').trim() : '';
-                user = user.replace(/^You said\s*/i, '').trim();
-                const model = strip(c.querySelector('message-content'));
-                const srcs = Array.from(c.querySelectorAll('img'))
-                    .filter(im => (im.naturalWidth || 0) >= 512)
-                    .map(im => im.src)
-                    .filter(s => s && !s.startsWith('data:image/svg'));
-                return { user, model, srcs };
-            });
-        }""",
-        _SOURCE_CHIP_SEL,
-    )
+        debug(f"_scrape_transcript failed: {exc}")
+        return []
 
     messages = []
-    seen_src = set()
-    budget = max_images
     for turn in raw:
         if turn.get("user"):
             messages.append({"role": "user", "text": turn["user"], "images": []})
-        imgs = []
-        for src in turn.get("srcs", []):
-            if budget <= 0 or src in seen_src:
-                continue
-            seen_src.add(src)
-            b64 = _fetch_image_b64(page, src)
-            if b64:
-                imgs.append(b64)
-                budget -= 1
-        if turn.get("model") or imgs:
-            messages.append({"role": "assistant", "text": turn.get("model", ""), "images": imgs})
+        if turn.get("model") or turn.get("images"):
+            messages.append({"role": "assistant", "text": turn.get("model", ""),
+                             "images": turn.get("images", [])})
     return messages
 
 
