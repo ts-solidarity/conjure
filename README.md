@@ -5,7 +5,7 @@ CLI tool that generates images through ChatGPT and Gemini by automating their we
 ## Setup
 
 ```
-git clone https://github.com/ts-solidarity/conjure.git
+git clone https://github.com/wleeaf/conjure.git
 cd conjure
 ./setup
 ```
