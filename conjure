@@ -163,6 +163,25 @@ def debug(msg: str):
         print(f"[{datetime.now():%H:%M:%S}] {msg}", file=sys.stderr)
 
 
+def _stdout_encodable(sample: str) -> bool:
+    try:
+        sample.encode(sys.stdout.encoding or "ascii")
+        return True
+    except (UnicodeEncodeError, LookupError, TypeError, AttributeError):
+        return False
+
+
+# --doctor output uses these markers; they degrade to ASCII when stdout cannot
+# encode them (a C locale, or a redirected pipe) so the health check never
+# crashes with UnicodeEncodeError on its own output.
+if _stdout_encodable("✓✗⚠·─→—"):
+    MARK_OK, MARK_BAD, MARK_WARN, MARK_INFO = "✓", "✗", "⚠", "·"
+    RULE, ARROW, DASH = "─", "→", "—"
+else:
+    MARK_OK, MARK_BAD, MARK_WARN, MARK_INFO = "[OK]", "[X]", "[!]", "-"
+    RULE, ARROW, DASH = "-", "->", "-"
+
+
 class StepFailure(Exception):
     """A brittle automation step failed (e.g. a selector stopped matching).
 
@@ -737,17 +756,17 @@ def _probe_send_selector(page, svc):
 def _doctor_probe_service(name, svc):
     """Launch a headless browser, load the service, and report login state plus
     live resolution of the static selectors. Read-only — sends no prompt."""
-    print(f"  launching headless browser → {svc['url']}")
+    print(f"  launching headless browser {ARROW} {svc['url']}")
     try:
         ctx, page = launch_browser(svc["profile"])
     except Exception as exc:
-        print(f"  ✗ could not launch browser: {exc}")
+        print(f"  {MARK_BAD} could not launch browser: {exc}")
         return False
     try:
         try:
             page.goto(svc["url"], timeout=30000)
         except Exception as exc:
-            print(f"  ✗ navigation failed: {exc}")
+            print(f"  {MARK_BAD} navigation failed: {exc}")
             return False
         try:
             page.wait_for_selector(svc["input_sel"], timeout=15000)
@@ -757,17 +776,17 @@ def _doctor_probe_service(name, svc):
         # Login gate first: a logged-out page is a login wall, so every
         # downstream selector would falsely read as "broken".
         if not is_logged_in(page, svc):
-            print(f"  ✗ not logged in — run: conjure --login {name}")
+            print(f"  {MARK_BAD} not logged in {DASH} run: conjure --login {name}")
             print("    (skipping selector checks; the page is a login wall)")
             return False
-        print("  ✓ logged in")
+        print(f"  {MARK_OK} logged in")
 
         ok = True
 
         count = page.locator(svc["input_sel"]).count()
         good = count > 0
         ok = ok and good
-        print(f"  {'✓' if good else '✗'} input selector  ({count} match)  {svc['input_sel']}")
+        print(f"  {MARK_OK if good else MARK_BAD} input selector  ({count} match)  {svc['input_sel']}")
 
         nc_matched = False
         nc_report = []
@@ -780,7 +799,7 @@ def _doctor_probe_service(name, svc):
             nc_matched = nc_matched or c > 0
         # New-chat has a reload fallback in the real flow, so a miss is a
         # warning, not a hard failure.
-        print(f"  {'✓' if nc_matched else '⚠'} new-chat selector  "
+        print(f"  {MARK_OK if nc_matched else MARK_WARN} new-chat selector  "
               + ("one variant matched" if nc_matched
                  else "none matched (reload fallback would be used)"))
         for sel, c in nc_report:
@@ -789,12 +808,12 @@ def _doctor_probe_service(name, svc):
         send_ok, send_status = _probe_send_selector(page, svc)
         if send_ok is False:
             ok = False
-        send_mark = {True: "✓", False: "✗", None: "⚠"}[send_ok]
+        send_mark = {True: MARK_OK, False: MARK_BAD, None: MARK_WARN}[send_ok]
         print(f"  {send_mark} {send_status}")
 
         dynamic = [s for s in selector_specs(svc) if s[2] == "dynamic" and s[0] != "send"]
         if dynamic:
-            print("  · dynamic selectors (only verifiable during a real run):")
+            print(f"  {MARK_INFO} dynamic selectors (only verifiable during a real run):")
             for label, sel, _ in dynamic:
                 print(f"        {label:<10} {sel}")
 
@@ -809,28 +828,28 @@ def _doctor_probe_service(name, svc):
 def do_doctor(targets):
     """Environment + selector health check. Returns a process exit code."""
     print("conjure doctor")
-    print("─" * 48)
+    print(RULE * 48)
 
     if cloak_launch is None:
-        print("✗ dependencies: NOT installed")
+        print(f"{MARK_BAD} dependencies: NOT installed")
         if IMPORT_ERROR:
             print(f"    {IMPORT_ERROR}")
         print("    fix: cd conjure && ./setup")
         return 1
-    print("✓ dependencies: cloakbrowser + playwright import OK")
-    print(f"· config dir: {CONFIG_DIR} "
+    print(f"{MARK_OK} dependencies: cloakbrowser + playwright import OK")
+    print(f"{MARK_INFO} config dir: {CONFIG_DIR} "
           f"({'exists' if CONFIG_DIR.exists() else 'missing (created on first login)'})")
 
     overall = True
     for name in targets:
         svc = SERVICES[name]
         print()
-        print(f"── {name} ──────────────")
+        print(f"{RULE * 2} {name} {RULE * 14}")
         profile = svc["profile"]
         if profile.exists():
-            print(f"  ✓ profile: {profile}")
+            print(f"  {MARK_OK} profile: {profile}")
         else:
-            print(f"  ✗ profile missing — run: conjure --login {name}")
+            print(f"  {MARK_BAD} profile missing {DASH} run: conjure --login {name}")
             overall = False
             continue
         if not _doctor_probe_service(name, svc):
@@ -840,8 +859,8 @@ def do_doctor(targets):
     if overall:
         print("All checks passed.")
     else:
-        print("Some checks failed — see above. A '✗' on a static selector means "
-              "the page markup changed; update that selector in the SERVICES table.")
+        print(f"Some checks failed {DASH} see above. A '{MARK_BAD}' on a static selector "
+              "means the page markup changed; update that selector in the SERVICES table.")
     return 0 if overall else 1
 
 
