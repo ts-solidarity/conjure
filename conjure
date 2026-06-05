@@ -1203,6 +1203,22 @@ def _image_bytes(page, img_element, service_name):
     return None
 
 
+def _reply_progressed(page, svc, before, before_reply):
+    """True if a new assistant reply has appeared since `before` — detected by
+    reply-node count, changed text, or a new image (image-only replies may add
+    no text). Used to tell a real reply from a silently-lost send."""
+    try:
+        st = get_page_state(page, svc)
+    except Exception:
+        return False
+    if st["response_nodes"] > before["response_nodes"]:
+        return True
+    current = _latest_assistant_text(page, svc) or ""
+    if current and current != before_reply:
+        return True
+    return bool(find_new_images(page, before["image_srcs"]))
+
+
 def chat_once(page, svc, message, continue_id=None):
     """Run one chat turn on an EXISTING (warm) page — no launch or close.
 
@@ -1228,14 +1244,37 @@ def chat_once(page, svc, message, continue_id=None):
             "The page may have changed, or the session expired.",
         )
 
-    _, baseline = _send_prompt(page, svc, message)
-    wait_response_done(page, svc, timeout=180, failure_check=check_quota_only)
+    # Capture pre-send state so we can confirm a *new* reply actually appears.
+    # Gemini sometimes clears the composer (which _send_prompt reads as "sent")
+    # without the message landing; we must not return the previous turn's text.
+    before = get_page_state(page, svc)
+    before_reply = _latest_assistant_text(page, svc) or ""
+
+    progressed = False
+    for attempt in range(2):
+        _send_prompt(page, svc, message)
+        wait_response_done(page, svc, timeout=180, failure_check=check_quota_only)
+        # Give the reply a moment to render, then confirm it actually progressed.
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            if _reply_progressed(page, svc, before, before_reply):
+                progressed = True
+                break
+            time.sleep(2)
+        if progressed:
+            break
+        debug(f"send attempt {attempt + 1}: no new reply appeared; retrying")
+
+    if not progressed:
+        raise StepFailure(
+            "the message didn't reach Gemini (no new reply appeared)",
+            "Try again — if it persists the composer/send may have changed; run 'conjure doctor gemini'.",
+        )
+
     reply = (_latest_assistant_text(page, svc) or "").strip()
     conv_id = _conversation_id(page.url)
-
-    time.sleep(2)
     images = []
-    for img in find_new_images(page, baseline["image_srcs"]):
+    for img in find_new_images(page, before["image_srcs"]):
         data = _image_bytes(page, img, "gemini")
         if data:
             images.append(data)
