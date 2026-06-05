@@ -554,6 +554,7 @@ def save_image_via_download_gemini(page, img_element, filepath):
         time.sleep(1)
         btn = page.locator('button[aria-label="Download full size image"]')
         if btn.count() == 0 or not btn.is_visible():
+            debug("gemini: download button not found/visible")
             return False
         with page.expect_download(timeout=30000) as dl_info:
             btn.click()
@@ -562,8 +563,8 @@ def save_image_via_download_gemini(page, img_element, filepath):
         if filepath.stat().st_size > 1024:
             return True
         filepath.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        debug(f"gemini download save failed: {exc}")
     return False
 
 
@@ -580,6 +581,7 @@ def save_image_via_download_chatgpt(page, img_element, filepath):
         try:
             save_btn.wait_for(state="visible", timeout=10000)
         except PlaywrightTimeout:
+            debug("chatgpt: Save button never became visible")
             page.keyboard.press("Escape")
             return False
         with page.expect_download(timeout=30000) as dl_info:
@@ -597,7 +599,8 @@ def save_image_via_download_chatgpt(page, img_element, filepath):
         if filepath.stat().st_size > 1024:
             return True
         filepath.unlink(missing_ok=True)
-    except Exception:
+    except Exception as exc:
+        debug(f"chatgpt download save failed: {exc}")
         try:
             page.keyboard.press("Escape")
         except Exception:
@@ -622,8 +625,8 @@ def save_image_via_fetch(page, img_element, filepath):
         if filepath.stat().st_size > 1024:
             return True
         filepath.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        debug(f"fetch save failed, trying canvas fallback: {exc}")
 
     # Canvas fallback
     try:
@@ -638,8 +641,8 @@ def save_image_via_fetch(page, img_element, filepath):
         if filepath.stat().st_size > 1024:
             return True
         filepath.unlink(missing_ok=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        debug(f"canvas save fallback failed: {exc}")
 
     return False
 
@@ -659,6 +662,7 @@ def find_best_image(page, before_srcs):
     page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
     time.sleep(1)
     candidates = []
+    errors = 0
     for img in page.locator("img").all():
         try:
             src = img.get_attribute("src") or ""
@@ -671,8 +675,10 @@ def find_best_image(page, before_srcs):
                 continue
             candidates.append((img, src, natural_w))
         except Exception:
+            errors += 1
             continue
 
+    debug(f"find_best_image: {len(candidates)} candidate(s), {errors} img error(s)")
     if not candidates:
         return None
 
@@ -868,20 +874,38 @@ def do_generate(service_name, prompt, edit_image=None):
     ctx, page = launch_browser(svc["profile"])
 
     try:
+        debug(f"navigating to {svc['url']}")
         page.goto(svc["url"])
         ensure_logged_in(page, svc)
+        debug("logged in; ensuring a fresh chat")
         ensure_fresh_chat(page, svc)
 
-        page.wait_for_selector(svc["input_sel"], timeout=15000)
+        try:
+            page.wait_for_selector(svc["input_sel"], timeout=15000)
+        except PlaywrightTimeout:
+            raise StepFailure(
+                "the prompt input never appeared",
+                f"The page layout may have changed, or the session may be invalid. "
+                f"Run 'conjure --doctor {service_name}' to check.",
+            )
+        debug("prompt input ready")
 
         # Upload image if editing
         if edit_image:
-            svc["upload"](page, edit_image)
+            debug(f"uploading {edit_image}")
+            try:
+                svc["upload"](page, edit_image)
+            except Exception as exc:
+                raise StepFailure(
+                    f"image upload failed ({exc})",
+                    f"The upload control may have changed. "
+                    f"Run 'conjure --doctor {service_name}' to check.",
+                )
             # Wait for upload preview to appear (not a fixed delay)
             try:
                 page.locator('img[src*="blob:"]').first.wait_for(timeout=30000)
             except PlaywrightTimeout:
-                pass
+                debug("upload preview did not appear within 30s; continuing anyway")
             time.sleep(1)
 
         # Type prompt
@@ -915,6 +939,7 @@ def do_generate(service_name, prompt, edit_image=None):
         # Verify message was sent relative to the pre-submit page state
         sent = wait_for_send_confirmation(page, svc, baseline)
         if not sent:
+            debug("send not confirmed; retrying once")
             # Retry send
             send = page.locator(svc["send_sel"])
             if send.count() > 0 and send.is_enabled():
@@ -923,17 +948,25 @@ def do_generate(service_name, prompt, edit_image=None):
                 page.keyboard.press("Enter")
             time.sleep(10)
             sent = True  # best effort
+        else:
+            debug("send confirmed")
 
         before_srcs = baseline["image_srcs"]
 
         print("Waiting for image generation (this can take a minute)...")
 
         if not wait_response_done(page, svc, timeout=180):
+            debug("wait_response_done timed out after 180s")
             print("Warning: timed out waiting for response.")
+        else:
+            debug("response generation complete")
 
         print("Waiting for image to finish rendering...")
         if not wait_for_images(page, before_srcs, svc):
+            debug("wait_for_images timed out")
             print("Warning: images may not be fully rendered.")
+        else:
+            debug("image detected in response")
 
         # Find and save the best image
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -956,16 +989,26 @@ def do_generate(service_name, prompt, edit_image=None):
 
         if best and save_image(page, best, filepath, service_name):
             print(f"Saved: {filepath}")
+            debug("image saved successfully")
         else:
             assistant_text = _latest_assistant_text(page, svc)
-            if assistant_text:
+            if best:
+                print("Found an image in the response but could not save it.")
+            elif assistant_text:
                 print(
                     f"No image in response. {service_name} replied with text:\n  "
                     + assistant_text.replace("\n", "\n  ")
                 )
-            debug = output_dir / f"{slug}-{timestamp}-debug.png"
-            page.screenshot(path=str(debug), full_page=True)
-            print(f"Debug screenshot: {debug}")
+            else:
+                print(f"No image found in the {service_name} response.")
+            dest = capture_diagnostics(
+                page,
+                svc,
+                "image found but save failed" if best else "no image in response",
+            )
+            if dest:
+                print(f"Diagnostics saved: {dest}")
+            sys.exit(4)
 
     except ServiceFailure as exc:
         # Let the assistant finish streaming before snapshotting the reply,
@@ -984,8 +1027,23 @@ def do_generate(service_name, prompt, edit_image=None):
             + final_text.replace("\n", "\n  ")
         )
         sys.exit(2)
+    except StepFailure as exc:
+        print(f"\n{service_name}: {exc.step}.")
+        if exc.hint:
+            print(f"  {exc.hint}")
+        dest = capture_diagnostics(page, svc, exc.step)
+        if dest:
+            print(f"  Diagnostics saved: {dest}")
+        sys.exit(3)
     except KeyboardInterrupt:
         print("\nCancelled.")
+    except Exception as exc:
+        debug(f"unexpected error: {exc!r}")
+        print(f"\nUnexpected error: {exc}")
+        dest = capture_diagnostics(page, svc, f"unexpected: {type(exc).__name__}: {exc}")
+        if dest:
+            print(f"  Diagnostics saved: {dest}")
+        sys.exit(1)
     finally:
         try:
             ctx.close()
