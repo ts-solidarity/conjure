@@ -107,15 +107,24 @@ function clearThread(emptyState) {
 }
 
 // ── chat list ─────────────────────────────────────────────────────
+function saveChatsCache() { try { localStorage.setItem("conjure.chats", JSON.stringify(state.chats)); } catch (e) {} }
+function loadChatsCache() {
+  try {
+    const c = JSON.parse(localStorage.getItem("conjure.chats") || "[]");
+    if (Array.isArray(c) && c.length) { state.chats = c; renderChatList(); }
+  } catch (e) {}
+}
 async function loadChats() {
   const list = $("#chat-list");
-  list.innerHTML = `<div class="skeleton s3"></div><div class="skeleton s2"></div><div class="skeleton s3"></div><div class="skeleton"></div>`;
+  // Only show skeletons if we have nothing cached to show meanwhile.
+  if (!state.chats.length) list.innerHTML = `<div class="skeleton s3"></div><div class="skeleton s2"></div><div class="skeleton s3"></div><div class="skeleton"></div>`;
   try {
     const data = await api("/chats");
     state.chats = data.conversations || [];
     renderChatList();
+    saveChatsCache();
   } catch (e) {
-    list.innerHTML = `<div class="chat-item" style="color:var(--bad)">couldn't load chats</div>`;
+    if (!state.chats.length) list.innerHTML = `<div class="chat-item" style="color:var(--bad)">couldn't load chats</div>`;
   }
 }
 function renderChatList() {
@@ -254,7 +263,8 @@ function autosize() { const i = $("#input"); i.style.height = "auto"; i.style.he
 
 window.addEventListener("DOMContentLoaded", () => {
   clearThread(true);
-  loadChats();
+  loadChatsCache();  // paint the sidebar instantly from cache…
+  loadChats();       // …then refresh in the background
 
   $("#new-chat").onclick = () => {
     if (state.sending) return;

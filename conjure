@@ -519,50 +519,52 @@ def wait_for_send_confirmation(page, svc, baseline, timeout=30):
 
 
 def wait_response_done(page, svc, timeout=180, failure_check=check_for_failure):
-    time.sleep(3)
+    """Wait until the reply finishes generating. Keys off the stop button —
+    present while generating, gone within ~0.5s of completion — which is far
+    faster than waiting for content to go stale. Content-stability is only a
+    fallback for the rare case where the stop button never appears (e.g. an
+    instant/cached reply)."""
     deadline = time.time() + timeout
     response_sel = svc.get("response_sel")
-    last_content = ""
-    stable_since = None
 
-    while time.time() < deadline:
-        # If the assistant already replied with a refusal/quota message,
-        # raise so the caller can stop waiting for an image that will never
-        # arrive. Chat passes check_quota_only so a refusal counts as a
-        # normal reply rather than a failure.
+    def generating():
+        return any(page.locator(sel).count() > 0 for sel in svc["stop_sels"])
+
+    # Phase 1: wait briefly for generation to START (stop button to appear), so
+    # we don't read "done" in the gap between sending and the button rendering.
+    start_deadline = time.time() + 6
+    while time.time() < start_deadline and not generating():
         if failure_check:
             failure_check(page, svc)
+        time.sleep(0.3)
 
-        # Stop button detection
-        generating = any(
-            page.locator(sel).count() > 0 for sel in svc["stop_sels"]
-        )
-        if not generating:
-            time.sleep(2)
-            still = any(
-                page.locator(sel).count() > 0 for sel in svc["stop_sels"]
-            )
-            if not still:
-                return True
+    # Phase 2: done once the stop button has been gone for a short settle (or,
+    # fallback, the reply text holds steady when the button never showed).
+    last_content, stable_since, gone_since = "", None, None
+    while time.time() < deadline:
+        if failure_check:
+            failure_check(page, svc)
+        if generating():
+            gone_since = None
+        elif gone_since is None:
+            gone_since = time.time()
+        elif time.time() - gone_since >= 0.8:
+            return True
 
-        # Gemini: content stability fallback (stop button lingers)
         if response_sel:
             try:
                 els = page.locator(response_sel)
                 if els.count() > 0:
-                    content = els.last.evaluate("el => el.innerHTML")
+                    content = els.last.evaluate("el => el.innerText")
                     if content and content == last_content:
-                        if stable_since is None:
-                            stable_since = time.time()
-                        elif time.time() - stable_since >= 8:
+                        stable_since = stable_since or time.time()
+                        if time.time() - stable_since >= 4:
                             return True
                     else:
-                        last_content = content
-                        stable_since = None
+                        last_content, stable_since = content, None
             except Exception:
                 pass
-
-        time.sleep(1)
+        time.sleep(0.3)
     return False
 
 
@@ -1160,12 +1162,12 @@ def _send_prompt(page, svc, text, edit_image=None):
 
     field = page.locator(svc["input_sel"])
     field.click()
-    time.sleep(0.3)
+    time.sleep(0.2)
     try:
         field.fill(text)
     except Exception:
         page.keyboard.type(text, delay=10)
-    time.sleep(0.5)
+    time.sleep(0.3)
 
     baseline = get_page_state(page, svc)
     send = page.locator(svc["send_sel"])
@@ -1173,7 +1175,7 @@ def _send_prompt(page, svc, text, edit_image=None):
         send.wait_for(state="visible", timeout=10000)
     except PlaywrightTimeout:
         pass
-    time.sleep(1)
+    time.sleep(0.5)
     if send.count() > 0 and send.is_enabled():
         send.click()
     else:
@@ -1280,11 +1282,15 @@ def chat_once(page, svc, message, continue_id=None, upload_path=None):
     strings; title scraped from the tab). Raises ServiceFailure on a quota wall
     and StepFailure if the page looks broken. Shared by the CLI and API."""
     if continue_id:
-        target = continue_id if "/app/" in continue_id else f"{svc['url'].rstrip('/')}/{continue_id}"
-        page.goto(target)
-        time.sleep(2)
-        if not has_conversation_history(page, svc):
-            debug("continue: no history loaded for that id; sending as a new turn")
+        want = _conversation_id(continue_id) or continue_id
+        if _conversation_id(page.url) == want:
+            debug(f"already on conversation {want}; skipping navigation")
+        else:
+            target = continue_id if "/app/" in continue_id else f"{svc['url'].rstrip('/')}/{continue_id}"
+            page.goto(target)
+            time.sleep(2)
+            if not has_conversation_history(page, svc):
+                debug("continue: no history loaded for that id; sending as a new turn")
     else:
         ensure_fresh_chat(page, svc)
 
@@ -1313,7 +1319,7 @@ def chat_once(page, svc, message, continue_id=None, upload_path=None):
             if _reply_progressed(page, svc, before, before_reply):
                 progressed = True
                 break
-            time.sleep(2)
+            time.sleep(0.5)
         if progressed:
             break
         debug(f"send attempt {attempt + 1}: no new reply appeared; retrying")
@@ -1507,10 +1513,12 @@ def _scrape_transcript(page, svc, max_images=8):
                 let budget = maxImages;
                 const out = [];
                 for (const c of document.querySelectorAll('.conversation-container')) {
-                    // Scroll this turn into view and let it paint, so lazy
-                    // attachments/images materialise before we query them.
-                    try { c.scrollIntoView({ block: 'center' }); } catch (e) {}
-                    await sleep(450);
+                    // Only pay the lazy-load scroll/wait for turns that actually
+                    // have media; text-only turns skip it (~0.45s saved each).
+                    if (c.querySelector('img[alt*="AI generated"], img.preview-image, img[alt="Uploaded image preview"], .file-preview-container')) {
+                        try { c.scrollIntoView({ block: 'center' }); } catch (e) {}
+                        await sleep(450);
+                    }
 
                     const q = c.querySelector('.query-text')
                         || c.querySelector('user-query-content') || c.querySelector('user-query');
@@ -1796,7 +1804,7 @@ class _APIHandler(BaseHTTPRequestHandler):
                     page.wait_for_selector("message-content", timeout=20000)
                 except Exception:
                     pass
-                time.sleep(1.5)
+                time.sleep(0.6)
                 return self._send(200, {"conversation_id": conv_id,
                                         "messages": _scrape_transcript(page, svc)})
             except Exception as exc:
