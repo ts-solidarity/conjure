@@ -57,6 +57,7 @@ SERVICES = {
             'button[aria-label="Stop response"]',
         ],
         "response_sel": "message-content",
+        "chats_sel": 'a[href*="/app/"]',
         "login_sels": 'a:has-text("Sign in"), button:has-text("Sign in")',
         "prompt_prefix": "Generate an image of ",
         "edit_prefix": "Edit this image: ",
@@ -224,6 +225,8 @@ def selector_specs(svc):
         specs.append(("stop", sel, "dynamic"))
     if svc.get("response_sel"):
         specs.append(("response", svc["response_sel"], "dynamic"))
+    if svc.get("chats_sel"):
+        specs.append(("chats", svc["chats_sel"], "dynamic"))
     return specs
 
 
@@ -1292,10 +1295,64 @@ def do_chat(message, continue_id=None):
             pass
 
 
+def _scrape_conversations(page, svc, limit=30):
+    """Scrape (id, title) pairs from the Gemini sidebar conversation links."""
+    out = []
+    seen = set()
+    links = page.locator(svc["chats_sel"])
+    for i in range(links.count()):
+        try:
+            el = links.nth(i)
+            conv_id = _conversation_id(el.get_attribute("href") or "")
+            if not conv_id or conv_id in seen:
+                continue
+            title = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
+            title = " ".join(title.split())
+            seen.add(conv_id)
+            out.append((conv_id, title or "(untitled)"))
+            if len(out) >= limit:
+                break
+        except Exception as exc:
+            debug(f"scrape conversation {i} failed: {exc}")
+            continue
+    return out
+
+
 def do_list_chats():
-    """List recent Gemini conversations (implemented in a later step)."""
-    print("conjure chats: conversation listing isn't wired up yet — coming next.")
-    return 1
+    """List recent Gemini conversations scraped from the sidebar."""
+    svc = SERVICES["gemini"]
+    ctx, page = launch_browser(svc["profile"])
+    try:
+        page.goto(svc["url"])
+        ensure_logged_in(page, svc)
+        time.sleep(3)  # let the sidebar populate
+        convos = _scrape_conversations(page, svc)
+        if not convos:
+            print("No conversations found in the sidebar.")
+            dest = capture_diagnostics(page, svc, "chats: nothing scraped")
+            if dest:
+                print(f"  Diagnostics saved: {dest}")
+            return 1
+        print(f"Recent Gemini conversations ({len(convos)}):\n")
+        for conv_id, title in convos:
+            print(f"  {conv_id}  {title}")
+        print('\nContinue one with:  conjure chat -c <id> "..."')
+        return 0
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+        return 1
+    except Exception as exc:
+        debug(f"chats error: {exc!r}")
+        print(f"Couldn't list conversations: {exc}")
+        dest = capture_diagnostics(page, svc, f"chats: {type(exc).__name__}: {exc}")
+        if dest:
+            print(f"  Diagnostics saved: {dest}")
+        return 1
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
 
 
 # ── CLI ───────────────────────────────────────────────────────────
