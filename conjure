@@ -107,24 +107,31 @@ class ServiceFailure(Exception):
         super().__init__(f"{reason}: {message[:120]}")
 
 
+# Gemini appends inline source-citation chips (e.g. "Britannica + 1") to grounded
+# replies. They render as <sources-carousel-inline>/<source-inline-chip> and inline
+# <source-footnote> markers; the answer text itself sits in <span class="citation-N">.
+# We strip the chips so the reply is just the answer.
+_SOURCE_CHIP_SEL = (
+    "sources-carousel-inline, sources-carousel, source-footnote, "
+    "source-inline-chip, .source-inline-chip-container"
+)
+
+
 def _latest_assistant_text(page, svc) -> str:
     response_sel = svc.get("response_sel")
     try:
-        if response_sel:
-            return page.evaluate(
-                """(sel) => {
-                    const els = document.querySelectorAll(sel);
-                    if (!els.length) return '';
-                    return (els[els.length - 1].innerText || '').trim();
-                }""",
-                response_sel,
-            )
         return page.evaluate(
-            """() => {
-                const turns = document.querySelectorAll('[data-turn="assistant"]');
-                if (!turns.length) return '';
-                return (turns[turns.length - 1].innerText || '').trim();
-            }"""
+            """([sel, chipSel]) => {
+                const els = sel
+                    ? document.querySelectorAll(sel)
+                    : document.querySelectorAll('[data-turn="assistant"]');
+                if (!els.length) return '';
+                // Clone so we never mutate the live page, then drop source chips.
+                const node = els[els.length - 1].cloneNode(true);
+                node.querySelectorAll(chipSel).forEach(e => e.remove());
+                return (node.innerText || '').trim();
+            }""",
+            [response_sel, _SOURCE_CHIP_SEL],
         )
     except Exception:
         return ""
