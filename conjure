@@ -138,6 +138,18 @@ def check_for_failure(page, svc):
             raise ServiceFailure("error", text)
 
 
+def check_quota_only(page, svc):
+    """Like check_for_failure but ignores content refusals. In a chat, "I can't
+    help with that" is a valid reply, not an error — only a quota wall is."""
+    text = _latest_assistant_text(page, svc)
+    if not text:
+        return
+    low = text.lower()
+    for pat in QUOTA_PATTERNS:
+        if re.search(pat, low):
+            raise ServiceFailure("quota", text)
+
+
 # ── Diagnostics & logging ─────────────────────────────────────────
 #
 # Automating a third-party web UI is inherently brittle: a selector change
@@ -477,7 +489,7 @@ def wait_for_send_confirmation(page, svc, baseline, timeout=30):
     return False
 
 
-def wait_response_done(page, svc, timeout=180):
+def wait_response_done(page, svc, timeout=180, failure_check=check_for_failure):
     time.sleep(3)
     deadline = time.time() + timeout
     response_sel = svc.get("response_sel")
@@ -486,9 +498,11 @@ def wait_response_done(page, svc, timeout=180):
 
     while time.time() < deadline:
         # If the assistant already replied with a refusal/quota message,
-        # raise so the caller can stop waiting for an image that will
-        # never arrive.
-        check_for_failure(page, svc)
+        # raise so the caller can stop waiting for an image that will never
+        # arrive. Chat passes check_quota_only so a refusal counts as a
+        # normal reply rather than a failure.
+        if failure_check:
+            failure_check(page, svc)
 
         # Stop button detection
         generating = any(
@@ -1070,107 +1084,290 @@ def do_generate(service_name, prompt, edit_image=None):
             pass
 
 
+def _send_prompt(page, svc, text, edit_image=None):
+    """Type text (optionally after uploading an image) into the composer and
+    submit it. Assumes the input selector is already present. Returns
+    (sent, baseline) where baseline is the pre-send page state (its image_srcs
+    let a caller diff out images that were already on the page)."""
+    if edit_image:
+        debug(f"uploading {edit_image}")
+        try:
+            svc["upload"](page, edit_image)
+        except Exception as exc:
+            raise StepFailure(
+                f"image upload failed ({exc})",
+                "The upload control may have changed. Run 'conjure doctor gemini' to check.",
+            )
+        try:
+            page.locator('img[src*="blob:"]').first.wait_for(timeout=30000)
+        except PlaywrightTimeout:
+            debug("upload preview did not appear within 30s; continuing anyway")
+        time.sleep(1)
+
+    field = page.locator(svc["input_sel"])
+    field.click()
+    time.sleep(0.3)
+    try:
+        field.fill(text)
+    except Exception:
+        page.keyboard.type(text, delay=10)
+    time.sleep(0.5)
+
+    baseline = get_page_state(page, svc)
+    send = page.locator(svc["send_sel"])
+    try:
+        send.wait_for(state="visible", timeout=10000)
+    except PlaywrightTimeout:
+        pass
+    time.sleep(1)
+    if send.count() > 0 and send.is_enabled():
+        send.click()
+    else:
+        page.keyboard.press("Enter")
+
+    sent = wait_for_send_confirmation(page, svc, baseline)
+    if not sent:
+        debug("send not confirmed; retrying once")
+        send = page.locator(svc["send_sel"])
+        if send.count() > 0 and send.is_enabled():
+            send.click()
+        else:
+            page.keyboard.press("Enter")
+        time.sleep(10)
+        sent = True  # best effort
+    else:
+        debug("send confirmed")
+    return sent, baseline
+
+
+def _conversation_id(url):
+    """Extract the Gemini conversation id from a page URL, or None."""
+    if url and "/app/" in url:
+        tail = url.split("/app/", 1)[1].split("?")[0].strip("/")
+        return tail or None
+    return None
+
+
+def do_chat(message, continue_id=None):
+    """Send a chat message to Gemini and print the reply. Starts a fresh chat,
+    or resumes an existing one when continue_id is given. Gemini-only in v1."""
+    svc = SERVICES["gemini"]
+
+    if continue_id:
+        if "/app/" in continue_id:
+            target_url = continue_id.split("?")[0]
+            label = _conversation_id(target_url) or continue_id
+        else:
+            target_url = f"{svc['url'].rstrip('/')}/{continue_id}"
+            label = continue_id
+        print(f"Continuing chat {label} (gemini): {message}")
+    else:
+        target_url = svc["url"]
+        print(f"New chat (gemini): {message}")
+
+    ctx, page = launch_browser(svc["profile"])
+    try:
+        debug(f"navigating to {target_url}")
+        page.goto(target_url)
+        ensure_logged_in(page, svc)
+
+        if continue_id:
+            time.sleep(2)  # let the conversation rehydrate
+            if not has_conversation_history(page, svc):
+                debug("no conversation history after navigating to the chat URL")
+                print("  Warning: that conversation didn't load; sending as a new turn.")
+        else:
+            ensure_fresh_chat(page, svc)
+
+        try:
+            page.wait_for_selector(svc["input_sel"], timeout=15000)
+        except PlaywrightTimeout:
+            raise StepFailure(
+                "the prompt input never appeared",
+                "The page may have changed, or the session is invalid. "
+                "Run 'conjure doctor gemini' to check.",
+            )
+
+        _send_prompt(page, svc, message)
+        print("Waiting for reply...")
+        # Chat: only a quota wall is a failure — a content refusal is a real reply.
+        if not wait_response_done(page, svc, timeout=180, failure_check=check_quota_only):
+            debug("wait_response_done timed out")
+            print("Warning: timed out waiting for the reply.")
+
+        reply = _latest_assistant_text(page, svc) or "(no text reply captured)"
+        conv_id = _conversation_id(page.url)
+
+        print()
+        print(reply)
+        print()
+        if conv_id:
+            print(f"[chat {conv_id}]  continue with:  conjure chat -c {conv_id} \"...\"")
+
+    except ServiceFailure as exc:
+        try:
+            time.sleep(2)
+            final_text = _latest_assistant_text(page, svc) or exc.message
+        except Exception:
+            final_text = exc.message
+        print("\ngemini: usage quota reached. Response:\n  " + final_text.replace("\n", "\n  "))
+        sys.exit(2)
+    except StepFailure as exc:
+        print(f"\ngemini: {exc.step}.")
+        if exc.hint:
+            print(f"  {exc.hint}")
+        dest = capture_diagnostics(page, svc, exc.step)
+        if dest:
+            print(f"  Diagnostics saved: {dest}")
+        sys.exit(3)
+    except KeyboardInterrupt:
+        print("\nCancelled.")
+    except Exception as exc:
+        debug(f"unexpected error: {exc!r}")
+        print(f"\nUnexpected error: {exc}")
+        dest = capture_diagnostics(page, svc, f"unexpected: {type(exc).__name__}: {exc}")
+        if dest:
+            print(f"  Diagnostics saved: {dest}")
+        sys.exit(1)
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+def do_list_chats():
+    """List recent Gemini conversations (implemented in a later step)."""
+    print("conjure chats: conversation listing isn't wired up yet — coming next.")
+    return 1
+
+
 # ── CLI ───────────────────────────────────────────────────────────
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(
-        prog="conjure",
-        description="Generate and edit images via ChatGPT and Gemini",
-        epilog=(
-            "Examples:\n"
-            '  conjure "a cat in a top hat"\n'
-            '  conjure --gemini "a red panda"\n'
-            '  conjure --edit img.png "add sunset"\n'
-            '  conjure --gemini --edit img.png "make it night"\n'
-            "  conjure --login gemini\n\n"
-            "Each run starts from a fresh chat before sending the prompt."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-    )
-    service = parser.add_mutually_exclusive_group()
-    service.add_argument(
-        "--chatgpt",
-        dest="service",
-        action="store_const",
-        const="chatgpt",
-        help="use ChatGPT (default)",
-    )
-    service.add_argument(
-        "--gemini",
-        dest="service",
-        action="store_const",
-        const="gemini",
-        help="use Gemini",
-    )
-    parser.set_defaults(service="chatgpt")
-    parser.add_argument(
-        "--edit",
-        metavar="IMAGE",
-        type=Path,
-        help="upload an image and edit it",
-    )
-    parser.add_argument(
-        "--login",
-        nargs="?",
-        const="",
-        metavar="SERVICE",
-        help="open a browser to log in and save the session",
-    )
-    parser.add_argument(
-        "--doctor",
-        nargs="?",
-        const="",
-        metavar="SERVICE",
-        help="run environment + selector health checks (all services, or one) and exit",
-    )
-    parser.add_argument(
-        "-v",
-        "--verbose",
-        action="store_true",
+    # -v lives on a shared parent so it appears in every subcommand's --help;
+    # main() resolves its value directly (see there) to dodge argparse's
+    # subparser-namespace reset.
+    parent = argparse.ArgumentParser(add_help=False)
+    parent.add_argument(
+        "-v", "--verbose", action="store_true",
         help="print a step-by-step diagnostic trace to stderr",
     )
-    parser.add_argument(
-        "prompt",
-        nargs="*",
-        help="image prompt",
+
+    parser = argparse.ArgumentParser(
+        prog="conjure",
+        description="Chat with Gemini (and generate images) via browser automation",
+        parents=[parent],
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            '  conjure "what is the capital of France?"      (start a new chat)\n'
+            '  conjure -c <id> "and its population?"         (continue a chat)\n'
+            "  conjure chats                                 (list conversations)\n"
+            '  conjure image "a samurai cat in the rain"     (generate an image)\n'
+            '  conjure image --edit photo.png "make it night"\n'
+            "  conjure login gemini\n"
+            "  conjure doctor\n\n"
+            "A bare prompt starts a new Gemini chat; subcommands cover the rest."
+        ),
     )
+    sub = parser.add_subparsers(dest="command")
+
+    p_chat = sub.add_parser(
+        "chat", parents=[parent],
+        help="send a message (new chat, or continue an existing one with -c)",
+    )
+    p_chat.add_argument(
+        "-c", "--continue", dest="continue_id", metavar="ID",
+        help="continue a conversation by id (or a full /app/<id> URL)",
+    )
+    p_chat.add_argument("message", nargs="*", help="the message to send")
+
+    sub.add_parser("chats", parents=[parent], help="list recent conversations")
+
+    p_img = sub.add_parser("image", parents=[parent], help="generate or edit an image")
+    grp = p_img.add_mutually_exclusive_group()
+    grp.add_argument("--gemini", dest="service", action="store_const", const="gemini",
+                     help="use Gemini (default)")
+    grp.add_argument("--chatgpt", dest="service", action="store_const", const="chatgpt",
+                     help="use ChatGPT")
+    p_img.set_defaults(service="gemini")
+    p_img.add_argument("--edit", metavar="IMAGE", type=Path, help="upload an image and edit it")
+    p_img.add_argument("prompt", nargs="*", help="image prompt")
+
+    p_login = sub.add_parser("login", parents=[parent], help="log in and save the session")
+    p_login.add_argument("service", nargs="?", default="gemini",
+                         help="chatgpt or gemini (default: gemini)")
+
+    p_doctor = sub.add_parser("doctor", parents=[parent],
+                              help="environment + selector health checks")
+    p_doctor.add_argument("service", nargs="?", help="chatgpt or gemini (default: all)")
+
     return parser
 
 
 def main():
+    known = {"chat", "chats", "image", "login", "doctor"}
+    raw = sys.argv[1:]
+    if not raw:
+        build_parser().print_help()
+        return
+
+    # Resolve --verbose ourselves (works in any position), then strip it so the
+    # chosen subparser's default doesn't reset it back to False.
+    verbose = any(t in ("-v", "--verbose") for t in raw)
+    raw = [t for t in raw if t not in ("-v", "--verbose")]
+    set_verbose(verbose)
+
+    # A bare invocation (no recognized subcommand) is treated as a new chat,
+    # so `conjure "hello"` just works. The first non-flag token decides.
+    first_pos = next((t for t in raw if not t.startswith("-")), None)
+    if first_pos is None:
+        build_parser().print_help()
+        return
+    if first_pos not in known:
+        raw = ["chat"] + raw
+
     parser = build_parser()
-    args = parser.parse_args()
+    args = parser.parse_args(raw)
+    command = args.command or "chat"
 
-    set_verbose(args.verbose)
-
-    if args.doctor is not None:
-        if args.doctor:
-            if args.doctor not in SERVICES:
-                parser.error(f"unknown service: {args.doctor}. Use: chatgpt or gemini")
-            targets = [args.doctor]
+    if command == "doctor":
+        if args.service:
+            if args.service not in SERVICES:
+                parser.error(f"unknown service: {args.service}. Use: chatgpt or gemini")
+            targets = [args.service]
         else:
             targets = list(SERVICES.keys())
         sys.exit(do_doctor(targets))
 
-    if args.login is not None:
-        service = args.login or args.service
-        if service not in SERVICES:
-            parser.error(f"unknown service: {service}. Use: chatgpt or gemini")
-        do_login(service)
+    if command == "login":
+        if args.service not in SERVICES:
+            parser.error(f"unknown service: {args.service}. Use: chatgpt or gemini")
+        do_login(args.service)
         return
 
-    edit_image = None
-    if args.edit is not None:
-        edit_image = args.edit.resolve()
-        if not edit_image.is_file():
-            parser.error(f"file not found: {edit_image}")
+    if command == "chats":
+        sys.exit(do_list_chats())
 
-    prompt = " ".join(args.prompt).strip()
-    if not prompt:
-        parser.error('the prompt is required unless "--login" is used')
+    if command == "image":
+        edit_image = None
+        if args.edit is not None:
+            edit_image = args.edit.resolve()
+            if not edit_image.is_file():
+                parser.error(f"file not found: {edit_image}")
+        prompt = " ".join(args.prompt).strip()
+        if not prompt:
+            parser.error("an image prompt is required")
+        do_generate(args.service, prompt, edit_image=edit_image)
+        return
 
-    do_generate(args.service, prompt, edit_image=edit_image)
+    # chat (explicit `chat` subcommand or a bare prompt)
+    message = " ".join(args.message).strip()
+    if not message:
+        parser.error('a message is required, e.g. conjure "hello"')
+    do_chat(message, continue_id=args.continue_id)
 
 
 if __name__ == "__main__":
