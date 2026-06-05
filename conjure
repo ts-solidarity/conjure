@@ -727,6 +727,50 @@ def find_best_image(page, before_srcs):
     return max(best_by_src.values(), key=lambda x: x[1])[0]
 
 
+def find_new_images(page, before_srcs):
+    """Return ALL new large AI-response images on the page (0..N), deduped by
+    src (highest-resolution element per src). Used by chat, where a reply may
+    contain several images; find_best_image returns only the single best."""
+    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    time.sleep(1)
+    best_by_src = {}
+    errors = 0
+    for img in page.locator("img").all():
+        try:
+            src = img.get_attribute("src") or ""
+            if not src or src in before_srcs or src.startswith("data:image/svg"):
+                continue
+            nw = img.evaluate("el => el.naturalWidth")
+            if nw < 512 or not _is_ai_response_image(img):
+                continue
+            if src not in best_by_src or nw > best_by_src[src][1]:
+                best_by_src[src] = (img, nw)
+        except Exception:
+            errors += 1
+            continue
+    debug(f"find_new_images: {len(best_by_src)} image(s), {errors} img error(s)")
+    return [img for img, _ in best_by_src.values()]
+
+
+def _save_reply_images(page, before_srcs, message):
+    """Download every new image in the latest reply (0..N) to the cwd, named
+    from the message + timestamp. Returns the list of saved paths."""
+    imgs = find_new_images(page, before_srcs)
+    if not imgs:
+        return []
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    slug = slugify(message) or "gemini-image"
+    saved = []
+    for i, img in enumerate(imgs):
+        suffix = "" if len(imgs) == 1 else f"-{i + 1}"
+        filepath = Path.cwd() / f"{slug}-{ts}{suffix}.png"
+        if save_image(page, img, filepath, "gemini"):
+            saved.append(filepath)
+        else:
+            debug(f"failed to save reply image {i + 1}/{len(imgs)}")
+    return saved
+
+
 # ── Commands ──────────────────────────────────────────────────────
 
 
@@ -1188,18 +1232,30 @@ def do_chat(message, continue_id=None):
                 "Run 'conjure doctor gemini' to check.",
             )
 
-        _send_prompt(page, svc, message)
+        _, baseline = _send_prompt(page, svc, message)
         print("Waiting for reply...")
         # Chat: only a quota wall is a failure — a content refusal is a real reply.
         if not wait_response_done(page, svc, timeout=180, failure_check=check_quota_only):
             debug("wait_response_done timed out")
             print("Warning: timed out waiting for the reply.")
 
-        reply = _latest_assistant_text(page, svc) or "(no text reply captured)"
+        reply_text = _latest_assistant_text(page, svc) or ""
         conv_id = _conversation_id(page.url)
 
+        # Harvest any images in the reply (0..N). Chat is mostly text, so we
+        # check once after the response settles rather than polling on a timer.
+        time.sleep(2)
+        saved = _save_reply_images(page, baseline["image_srcs"], message)
+
         print()
-        print(reply)
+        if reply_text:
+            print(reply_text)
+        elif saved:
+            print("(image reply)")
+        else:
+            print("(no reply captured)")
+        for filepath in saved:
+            print(f"Saved image: {filepath}")
         print()
         if conv_id:
             print(f"[chat {conv_id}]  continue with:  conjure chat -c {conv_id} \"...\"")
