@@ -76,9 +76,11 @@ body::after {
 }
 .chat-list { overflow-y: auto; flex: 1; display: flex; flex-direction: column; gap: 5px; padding-right: 4px; }
 .chat-item {
-  text-align: left; padding: 12px 13px; border-radius: 11px; cursor: pointer; line-height: 1.4;
+  flex: 0 0 auto;  /* don't let the column flexbox compress row height (clipped text) */
+  text-align: left; padding: 10px 13px; border-radius: 11px; cursor: pointer; line-height: 1.42;
   font-size: 14px; color: var(--text-dim); background: none; border: 1px solid transparent;
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: background .15s, color .15s;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  transition: background .15s, color .15s;
 }
 .chat-item:hover { background: var(--ink-2); color: var(--text); }
 .chat-item.active { background: var(--ember-dim); color: var(--text); border-color: rgba(239,157,77,0.3); }
