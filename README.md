@@ -54,14 +54,21 @@ If a reply contains images, they're downloaded to the current directory automati
 
 ## Images
 
+To generate an image on Gemini, **ask for one in a chat** — any images in the reply are saved to the current directory automatically (and `POST /chat` returns them as base64):
+
 ```
-conjure image "a samurai cat standing in the rain"
+conjure "create an image of a samurai cat standing in the rain"
+# → saves create-an-image-of-a-samurai-cat-20260328-200143.png
+```
+
+A dedicated one-shot command also exists:
+
+```
 conjure image --edit photo.png "make the sky purple"
+conjure image --chatgpt "a samurai cat standing in the rain"
 ```
 
-Image generation defaults to Gemini; add `--chatgpt` to use ChatGPT instead. The PNG is saved to your current directory, named from the prompt and timestamp (e.g. `a-samurai-cat-standing-in-the-rain-20260328-200143.png`).
-
-> Chat (`chat`/`chats`) is **Gemini-only**. Image generation works on both Gemini (default) and ChatGPT (`--chatgpt`).
+> Note: `conjure image`'s **Gemini** path (the default) is currently unreliable — prefer asking in a chat for Gemini image generation. The command works with `--chatgpt`.
 
 ## API server
 
