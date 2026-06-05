@@ -137,9 +137,26 @@ body::after {
 /* ── composer ── */
 .composer-wrap { padding: 8px 32px 22px; }
 .composer { max-width: 760px; margin: 0 auto; display: flex; align-items: flex-end; gap: 8px;
-  background: var(--ink-2); border: 1px solid var(--line-2); border-radius: 20px; padding: 9px 9px 9px 18px;
+  background: var(--ink-2); border: 1px solid var(--line-2); border-radius: 20px; padding: 9px;
   transition: border-color .18s, box-shadow .18s; }
 .composer:focus-within { border-color: var(--ember); box-shadow: 0 0 0 4px var(--ember-dim); }
+.attach-btn { flex: 0 0 40px; height: 40px; border-radius: 50%; border: 1px solid var(--line-2);
+  background: none; color: var(--text-dim); cursor: pointer; display: grid; place-items: center;
+  transition: border-color .15s, color .15s; }
+.attach-btn:hover { border-color: var(--ember); color: var(--ember-2); }
+
+.attach-chip { max-width: 760px; margin: 0 auto 8px; display: flex; align-items: center; gap: 11px;
+  background: var(--ink-2); border: 1px solid var(--line-2); border-radius: 14px; padding: 9px 11px; animation: rise .2s both; }
+.attach-chip img { width: 42px; height: 42px; object-fit: cover; border-radius: 9px; }
+.attach-chip .ic { font-size: 20px; }
+.attach-chip .name { flex: 1; font-size: 13.5px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.attach-chip .rm { background: none; border: none; color: var(--muted); cursor: pointer; font-size: 16px; padding: 4px 6px; border-radius: 8px; }
+.attach-chip .rm:hover { color: var(--bad); background: var(--ink-3); }
+
+.msg-files { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.msg-file { display: inline-flex; align-items: center; gap: 7px; background: var(--ink-2); border: 1px solid var(--line-2);
+  border-radius: 10px; padding: 7px 11px; font-size: 13px; color: var(--text-dim); }
+.msg-file .ic { color: var(--ember-2); }
 .composer textarea {
   flex: 1; resize: none; border: none; outline: none; background: none; color: var(--text);
   font-family: var(--sans); font-size: 15px; line-height: 1.5; max-height: 200px; padding: 7px 0;

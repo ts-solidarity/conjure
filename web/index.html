@@ -41,7 +41,14 @@
       <div id="thread" class="thread"></div>
 
       <div class="composer-wrap">
+        <div id="attach-chip" class="attach-chip hidden"></div>
         <form id="composer" class="composer">
+          <input id="file-input" type="file" hidden />
+          <button id="attach" type="button" class="attach-btn" aria-label="Attach a file or image">
+            <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+              <path d="M12 5v14M5 12h14" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+            </svg>
+          </button>
           <textarea id="input" rows="1" placeholder="Conjure something…" autocomplete="off"></textarea>
           <button id="send" type="submit" aria-label="Send" disabled>
             <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">

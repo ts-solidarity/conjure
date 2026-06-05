@@ -10,6 +10,7 @@ import json
 import base64
 import hashlib
 import secrets
+import shutil
 import tempfile
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
@@ -315,10 +316,12 @@ def capture_diagnostics(page, svc, step: str, extra: str = ""):
 
 
 def _gemini_upload(page, path):
-    page.locator(".upload-card-button").click()
+    # Open the "Upload & tools" menu, then "Upload files" (handles images,
+    # documents, data, code) and feed the file chooser.
+    page.locator('button[aria-label="Upload & tools"]').first.click()
     time.sleep(1)
     with page.expect_file_chooser() as fc_info:
-        page.locator('button[data-test-id="local-images-files-uploader-button"]').click()
+        page.locator('[data-test-id="local-images-files-uploader-button"]').click()
     fc_info.value.set_files(str(path))
 
 
@@ -987,7 +990,7 @@ def do_generate(service_name, prompt, edit_image=None):
                 )
             # Wait for upload preview to appear (not a fixed delay)
             try:
-                page.locator('img[src*="blob:"]').first.wait_for(timeout=30000)
+                page.locator('.file-preview-container, img[src*="blob:"]').first.wait_for(timeout=30000)
             except PlaywrightTimeout:
                 debug("upload preview did not appear within 30s; continuing anyway")
             time.sleep(1)
@@ -1206,6 +1209,22 @@ def _conversation_id(url):
     return m.group(1) if m else None
 
 
+def _conversation_title(page):
+    """The conversation's title from the tab (Gemini sets document.title to
+    '<title> - Google Gemini' once the chat is named), or None if unnamed."""
+    try:
+        title = (page.title() or "").strip()
+    except Exception:
+        return None
+    for suffix in (" - Google Gemini", " – Google Gemini", " - Gemini", " | Gemini"):
+        if title.endswith(suffix):
+            title = title[: -len(suffix)].strip()
+            break
+    if not title or title.lower() in ("google gemini", "gemini"):
+        return None
+    return title
+
+
 def _image_bytes(page, img_element, service_name):
     """Save an image element via the normal path and return its PNG bytes."""
     fd, tmp = tempfile.mkstemp(suffix=".png")
@@ -1218,6 +1237,21 @@ def _image_bytes(page, img_element, service_name):
         debug(f"_image_bytes failed: {exc}")
     finally:
         tmp_path.unlink(missing_ok=True)
+    return None
+
+
+def _request_image_b64(page, src):
+    """Fetch an image URL via Playwright's request API — uses the browser's
+    cookies and runs server-side, so it bypasses CORS and canvas-taint (needed
+    for cross-origin user uploads on googleusercontent). Returns base64."""
+    if not src or src.startswith(("data:", "blob:")):
+        return None
+    try:
+        resp = page.request.get(src, timeout=15000)
+        if resp.ok:
+            return base64.b64encode(resp.body()).decode()
+    except Exception as exc:
+        debug(f"_request_image_b64 failed: {exc}")
     return None
 
 
@@ -1237,14 +1271,14 @@ def _reply_progressed(page, svc, before, before_reply):
     return bool(find_new_images(page, before["image_srcs"]))
 
 
-def chat_once(page, svc, message, continue_id=None):
+def chat_once(page, svc, message, continue_id=None, upload_path=None):
     """Run one chat turn on an EXISTING (warm) page — no launch or close.
 
-    Starts a fresh chat, or resumes continue_id, sends the message, waits for
-    the reply, and harvests any images. Returns
-    {reply, conversation_id, images} where images is a list of PNG byte
-    strings. Raises ServiceFailure on a quota wall and StepFailure if the page
-    looks broken. Shared by the CLI (do_chat) and the API server."""
+    Starts a fresh chat, or resumes continue_id, optionally attaches a file
+    (upload_path), sends the message, waits for the reply, and harvests any
+    images. Returns {reply, conversation_id, images, title} (images = PNG byte
+    strings; title scraped from the tab). Raises ServiceFailure on a quota wall
+    and StepFailure if the page looks broken. Shared by the CLI and API."""
     if continue_id:
         target = continue_id if "/app/" in continue_id else f"{svc['url'].rstrip('/')}/{continue_id}"
         page.goto(target)
@@ -1270,7 +1304,8 @@ def chat_once(page, svc, message, continue_id=None):
 
     progressed = False
     for attempt in range(2):
-        _send_prompt(page, svc, message)
+        # Attach on the first try only; re-uploading on a retry would double it.
+        _send_prompt(page, svc, message, edit_image=(upload_path if attempt == 0 else None))
         wait_response_done(page, svc, timeout=180, failure_check=check_quota_only)
         # Give the reply a moment to render, then confirm it actually progressed.
         deadline = time.time() + 15
@@ -1296,7 +1331,14 @@ def chat_once(page, svc, message, continue_id=None):
         data = _image_bytes(page, img, "gemini")
         if data:
             images.append(data)
-    return {"reply": reply, "conversation_id": conv_id, "images": images}
+    # A new chat's title is generated async after the first turn — poll briefly.
+    title = _conversation_title(page)
+    if not title:
+        deadline = time.time() + 6
+        while time.time() < deadline and not title:
+            time.sleep(0.6)
+            title = _conversation_title(page)
+    return {"reply": reply, "conversation_id": conv_id, "images": images, "title": title}
 
 
 def do_chat(message, continue_id=None):
@@ -1450,30 +1492,54 @@ def _scrape_transcript(page, svc, max_images=8):
                     finally { chips.forEach((e, i) => { e.style.display = prev[i] || ''; }); }
                     return t;
                 };
+                const capture = async (im) => {
+                    try { im.scrollIntoView({ block: 'center' }); } catch (e) {}
+                    let tries = 0;
+                    while (!im.naturalWidth && tries < 20) { await sleep(300); tries++; }
+                    if (!im.naturalWidth) return '';
+                    try {
+                        const cv = document.createElement('canvas');
+                        cv.width = im.naturalWidth; cv.height = im.naturalHeight;
+                        cv.getContext('2d').drawImage(im, 0, 0);
+                        return (cv.toDataURL('image/png').split(',')[1]) || '';
+                    } catch (e) { return ''; }
+                };
                 let budget = maxImages;
                 const out = [];
                 for (const c of document.querySelectorAll('.conversation-container')) {
+                    // Scroll this turn into view and let it paint, so lazy
+                    // attachments/images materialise before we query them.
+                    try { c.scrollIntoView({ block: 'center' }); } catch (e) {}
+                    await sleep(450);
+
                     const q = c.querySelector('.query-text')
                         || c.querySelector('user-query-content') || c.querySelector('user-query');
                     let user = q ? (q.innerText || '').trim() : '';
                     user = user.replace(/^You said\s*/i, '').trim();
                     const model = strip(c.querySelector('message-content'));
-                    const images = [];
+
+                    // user-uploaded images: collect srcs only — they're served
+                    // cross-origin (googleusercontent), so canvas taints and
+                    // fetch is CORS-blocked; fetched server-side via Playwright.
+                    const userImageSrcs = [], userFiles = [];
+                    for (const im of c.querySelectorAll('img.preview-image, img[alt="Uploaded image preview"]')) {
+                        if (im.src && !im.src.startsWith('data:')) userImageSrcs.push(im.src);
+                    }
+                    // non-image uploads → filename chip
+                    for (const fp of c.querySelectorAll('.file-preview-container')) {
+                        if (fp.querySelector('img')) continue;
+                        const name = (fp.innerText || '').replace(/\s+/g, ' ').trim();
+                        if (name) userFiles.push(name.slice(0, 80));
+                    }
+
+                    // model-generated images (blob, same-origin → canvas works)
+                    const modelImages = [];
                     for (const im of c.querySelectorAll('img[alt*="AI generated"]')) {
                         if (budget <= 0) break;
-                        try { im.scrollIntoView({ block: 'center' }); } catch (e) {}
-                        let tries = 0;
-                        while (!im.naturalWidth && tries < 20) { await sleep(300); tries++; }
-                        if (!im.naturalWidth) continue;
-                        try {
-                            const cv = document.createElement('canvas');
-                            cv.width = im.naturalWidth; cv.height = im.naturalHeight;
-                            cv.getContext('2d').drawImage(im, 0, 0);
-                            const b64 = (cv.toDataURL('image/png').split(',')[1]) || '';
-                            if (b64) { images.push(b64); budget--; }
-                        } catch (e) {}
+                        const b64 = await capture(im);
+                        if (b64) { modelImages.push(b64); budget--; }
                     }
-                    out.push({ user, model, images });
+                    out.push({ user, model, userImageSrcs, userFiles, modelImages });
                 }
                 return out;
             }""",
@@ -1484,12 +1550,22 @@ def _scrape_transcript(page, svc, max_images=8):
         return []
 
     messages = []
+    budget = max_images
     for turn in raw:
-        if turn.get("user"):
-            messages.append({"role": "user", "text": turn["user"], "images": []})
-        if turn.get("model") or turn.get("images"):
+        user_images = []
+        for src in turn.get("userImageSrcs", []):
+            if budget <= 0:
+                break
+            b64 = _request_image_b64(page, src)
+            if b64:
+                user_images.append(b64)
+                budget -= 1
+        if turn.get("user") or user_images or turn.get("userFiles"):
+            messages.append({"role": "user", "text": turn.get("user", ""),
+                             "images": user_images, "files": turn.get("userFiles", [])})
+        if turn.get("model") or turn.get("modelImages"):
             messages.append({"role": "assistant", "text": turn.get("model", ""),
-                             "images": turn.get("images", [])})
+                             "images": turn.get("modelImages", []), "files": []})
     return messages
 
 
@@ -1758,9 +1834,26 @@ class _APIHandler(BaseHTTPRequestHandler):
         if body is None:
             return self._send(400, {"error": "invalid JSON body"})
         message = (body.get("message") or "").strip()
-        if not message:
-            return self._send(400, {"error": "message is required"})
+        file_obj = body.get("file") or None
+        if not message and not file_obj:
+            return self._send(400, {"error": "message or file is required"})
         continue_id = body.get("conversation_id") or None
+
+        # Materialise an uploaded file to a temp path (under its real name, so
+        # Gemini sees the right type) if one was sent.
+        upload_path, tmp_dir = None, None
+        if file_obj and file_obj.get("data"):
+            try:
+                tmp_dir = tempfile.mkdtemp(prefix="conjure-up-")
+                name = os.path.basename(file_obj.get("name") or "") or "upload"
+                upload_path = os.path.join(tmp_dir, name)
+                with open(upload_path, "wb") as fh:
+                    fh.write(base64.b64decode(file_obj["data"]))
+            except Exception as exc:
+                if tmp_dir:
+                    shutil.rmtree(tmp_dir, ignore_errors=True)
+                debug(f"/chat: bad file payload: {exc}")
+                return self._send(400, {"error": "invalid file payload"})
 
         # Rate gate: keep a minimum gap between Gemini sends.
         wait = self.server.min_interval - (time.time() - self.server.last_op)
@@ -1769,7 +1862,8 @@ class _APIHandler(BaseHTTPRequestHandler):
         self.server.last_op = time.time()
 
         try:
-            result = chat_once(self.server.page, self.server.svc, message, continue_id=continue_id)
+            result = chat_once(self.server.page, self.server.svc, message,
+                               continue_id=continue_id, upload_path=upload_path)
         except ServiceFailure as exc:
             return self._send(429, {"error": "quota", "detail": exc.message[:200]})
         except StepFailure as exc:
@@ -1777,11 +1871,15 @@ class _APIHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             debug(f"/chat error: {exc!r}")
             return self._send(500, {"error": str(exc)})
+        finally:
+            if tmp_dir:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
 
         return self._send(200, {
             "reply": result["reply"],
             "conversation_id": result["conversation_id"],
             "images": [base64.b64encode(d).decode() for d in result["images"]],
+            "title": result.get("title"),
         })
 
     def do_DELETE(self):
