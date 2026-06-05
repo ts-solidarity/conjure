@@ -6,7 +6,12 @@ import os
 import sys
 import re
 import time
+import json
 import base64
+import hashlib
+import secrets
+import tempfile
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from datetime import datetime
 
@@ -755,25 +760,6 @@ def find_new_images(page, before_srcs):
     return [img for img, _ in best_by_src.values()]
 
 
-def _save_reply_images(page, before_srcs, message):
-    """Download every new image in the latest reply (0..N) to the cwd, named
-    from the message + timestamp. Returns the list of saved paths."""
-    imgs = find_new_images(page, before_srcs)
-    if not imgs:
-        return []
-    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    slug = slugify(message) or "gemini-image"
-    saved = []
-    for i, img in enumerate(imgs):
-        suffix = "" if len(imgs) == 1 else f"-{i + 1}"
-        filepath = Path.cwd() / f"{slug}-{ts}{suffix}.png"
-        if save_image(page, img, filepath, "gemini"):
-            saved.append(filepath)
-        else:
-            debug(f"failed to save reply image {i + 1}/{len(imgs)}")
-    return saved
-
-
 # ── Commands ──────────────────────────────────────────────────────
 
 
@@ -1187,12 +1173,73 @@ def _send_prompt(page, svc, text, edit_image=None):
     return sent, baseline
 
 
+_CONV_ID_RE = re.compile(r"/app/([0-9a-fA-F]{6,})")
+# A genuine sidebar conversation link is a clean /app/<hex> with no trailing
+# query junk; the account/profile link embeds /app/<id>&ec=... and is excluded.
+_CONV_HREF_RE = re.compile(r"^(?:https://gemini\.google\.com)?/app/([0-9a-fA-F]{6,})/?$")
+
+
 def _conversation_id(url):
-    """Extract the Gemini conversation id from a page URL, or None."""
-    if url and "/app/" in url:
-        tail = url.split("/app/", 1)[1].split("?")[0].strip("/")
-        return tail or None
+    """Extract the Gemini conversation id from a URL, or None. Stops at the
+    hex run, so tracking params (&ec=…, ?foo) don't leak into the id."""
+    if not url:
+        return None
+    m = _CONV_ID_RE.search(url)
+    return m.group(1) if m else None
+
+
+def _image_bytes(page, img_element, service_name):
+    """Save an image element via the normal path and return its PNG bytes."""
+    fd, tmp = tempfile.mkstemp(suffix=".png")
+    os.close(fd)
+    tmp_path = Path(tmp)
+    try:
+        if save_image(page, img_element, tmp_path, service_name):
+            return tmp_path.read_bytes()
+    except Exception as exc:
+        debug(f"_image_bytes failed: {exc}")
+    finally:
+        tmp_path.unlink(missing_ok=True)
     return None
+
+
+def chat_once(page, svc, message, continue_id=None):
+    """Run one chat turn on an EXISTING (warm) page — no launch or close.
+
+    Starts a fresh chat, or resumes continue_id, sends the message, waits for
+    the reply, and harvests any images. Returns
+    {reply, conversation_id, images} where images is a list of PNG byte
+    strings. Raises ServiceFailure on a quota wall and StepFailure if the page
+    looks broken. Shared by the CLI (do_chat) and the API server."""
+    if continue_id:
+        target = continue_id if "/app/" in continue_id else f"{svc['url'].rstrip('/')}/{continue_id}"
+        page.goto(target)
+        time.sleep(2)
+        if not has_conversation_history(page, svc):
+            debug("continue: no history loaded for that id; sending as a new turn")
+    else:
+        ensure_fresh_chat(page, svc)
+
+    try:
+        page.wait_for_selector(svc["input_sel"], timeout=15000)
+    except PlaywrightTimeout:
+        raise StepFailure(
+            "the prompt input never appeared",
+            "The page may have changed, or the session expired.",
+        )
+
+    _, baseline = _send_prompt(page, svc, message)
+    wait_response_done(page, svc, timeout=180, failure_check=check_quota_only)
+    reply = (_latest_assistant_text(page, svc) or "").strip()
+    conv_id = _conversation_id(page.url)
+
+    time.sleep(2)
+    images = []
+    for img in find_new_images(page, baseline["image_srcs"]):
+        data = _image_bytes(page, img, "gemini")
+        if data:
+            images.append(data)
+    return {"reply": reply, "conversation_id": conv_id, "images": images}
 
 
 def do_chat(message, continue_id=None):
@@ -1201,54 +1248,30 @@ def do_chat(message, continue_id=None):
     svc = SERVICES["gemini"]
 
     if continue_id:
-        if "/app/" in continue_id:
-            target_url = continue_id.split("?")[0]
-            label = _conversation_id(target_url) or continue_id
-        else:
-            target_url = f"{svc['url'].rstrip('/')}/{continue_id}"
-            label = continue_id
-        print(f"Continuing chat {label} (gemini): {message}")
+        print(f"Continuing chat {_conversation_id(continue_id) or continue_id} (gemini): {message}")
     else:
-        target_url = svc["url"]
         print(f"New chat (gemini): {message}")
 
     ctx, page = launch_browser(svc["profile"])
     try:
-        debug(f"navigating to {target_url}")
-        page.goto(target_url)
+        page.goto(svc["url"])
         ensure_logged_in(page, svc)
-
-        if continue_id:
-            time.sleep(2)  # let the conversation rehydrate
-            if not has_conversation_history(page, svc):
-                debug("no conversation history after navigating to the chat URL")
-                print("  Warning: that conversation didn't load; sending as a new turn.")
-        else:
-            ensure_fresh_chat(page, svc)
-
-        try:
-            page.wait_for_selector(svc["input_sel"], timeout=15000)
-        except PlaywrightTimeout:
-            raise StepFailure(
-                "the prompt input never appeared",
-                "The page may have changed, or the session is invalid. "
-                "Run 'conjure doctor gemini' to check.",
-            )
-
-        _, baseline = _send_prompt(page, svc, message)
         print("Waiting for reply...")
-        # Chat: only a quota wall is a failure — a content refusal is a real reply.
-        if not wait_response_done(page, svc, timeout=180, failure_check=check_quota_only):
-            debug("wait_response_done timed out")
-            print("Warning: timed out waiting for the reply.")
+        result = chat_once(page, svc, message, continue_id=continue_id)
 
-        reply_text = _latest_assistant_text(page, svc) or ""
-        conv_id = _conversation_id(page.url)
+        reply_text = result["reply"]
+        conv_id = result["conversation_id"]
 
-        # Harvest any images in the reply (0..N). Chat is mostly text, so we
-        # check once after the response settles rather than polling on a timer.
-        time.sleep(2)
-        saved = _save_reply_images(page, baseline["image_srcs"], message)
+        # Write any harvested images to the cwd, named from the message.
+        saved = []
+        if result["images"]:
+            ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+            slug = slugify(message) or "gemini-image"
+            for i, data in enumerate(result["images"]):
+                suffix = "" if len(result["images"]) == 1 else f"-{i + 1}"
+                filepath = Path.cwd() / f"{slug}-{ts}{suffix}.png"
+                filepath.write_bytes(data)
+                saved.append(filepath)
 
         print()
         if reply_text:
@@ -1303,8 +1326,13 @@ def _scrape_conversations(page, svc, limit=30):
     for i in range(links.count()):
         try:
             el = links.nth(i)
-            conv_id = _conversation_id(el.get_attribute("href") or "")
-            if not conv_id or conv_id in seen:
+            # Only clean /app/<hex> links are conversations; skip the account
+            # menu link (/app/<id>&ec=…) and anything with query junk.
+            m = _CONV_HREF_RE.match((el.get_attribute("href") or "").strip())
+            if not m:
+                continue
+            conv_id = m.group(1)
+            if conv_id in seen:
                 continue
             title = (el.get_attribute("aria-label") or el.inner_text() or "").strip()
             title = " ".join(title.split())
@@ -1353,6 +1381,198 @@ def do_list_chats():
             ctx.close()
         except Exception:
             pass
+
+
+# ── API keys & server ─────────────────────────────────────────────
+#
+# conjure can run as a small local HTTP API in front of a single warm browser
+# session: one Chromium launch, then every request reuses it (no per-call cold
+# start). Clients authenticate with conjure-issued keys (random tokens, stored
+# hashed). The server is single-threaded, so browser operations naturally
+# serialize through the one page and stay on the thread that created it.
+
+API_KEYS_PATH = CONFIG_DIR / "api_keys.json"
+
+
+def _hash_key(raw):
+    return hashlib.sha256(raw.encode()).hexdigest()
+
+
+def _load_api_keys():
+    try:
+        return json.loads(API_KEYS_PATH.read_text())
+    except Exception:
+        return []
+
+
+def _save_api_keys(keys):
+    API_KEYS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    API_KEYS_PATH.write_text(json.dumps(keys, indent=2))
+    try:
+        API_KEYS_PATH.chmod(0o600)
+    except Exception:
+        pass
+
+
+def do_key(action, label=None):
+    """Manage conjure's own API keys. Only a SHA-256 hash is stored; the raw
+    token is shown once at creation."""
+    keys = _load_api_keys()
+    if action == "new":
+        raw = "cjr_" + secrets.token_hex(24)
+        entry = {
+            "label": label or "key",
+            "prefix": raw[:12],
+            "hash": _hash_key(raw),
+            "created": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        keys.append(entry)
+        _save_api_keys(keys)
+        print("New API key — shown once, store it now:\n")
+        print(f"    {raw}\n")
+        print(f"  label={entry['label']}  prefix={entry['prefix']}")
+        return 0
+    if action == "list":
+        if not keys:
+            print("No API keys yet. Create one: conjure key new [label]")
+            return 0
+        print(f"{len(keys)} API key(s):")
+        for k in keys:
+            print(f"  {k['prefix']}…  {k['label']:<16} created {k.get('created', '?')}")
+        return 0
+    if action == "revoke":
+        if not label:
+            print("Usage: conjure key revoke <label-or-prefix>")
+            return 1
+        kept = [k for k in keys
+                if label not in (k["label"], k["prefix"]) and not k["prefix"].startswith(label)]
+        _save_api_keys(kept)
+        print(f"Revoked {len(keys) - len(kept)} key(s).")
+        return 0
+    print(f"Unknown key action: {action}")
+    return 1
+
+
+class _APIHandler(BaseHTTPRequestHandler):
+    """Native conjure API over a warm Gemini browser session."""
+
+    def log_message(self, fmt, *args):
+        debug("http: " + (fmt % args))
+
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _authorized(self):
+        auth = self.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return False
+        return _hash_key(auth[7:].strip()) in self.server.key_hashes
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path == "/health":
+            return self._send(200, {"ok": True, "service": "gemini"})
+        if not self._authorized():
+            return self._send(401, {"error": "unauthorized"})
+        if path == "/chats":
+            try:
+                convos = _scrape_conversations(self.server.page, self.server.svc)
+                return self._send(200, {"conversations": [{"id": i, "title": t} for i, t in convos]})
+            except Exception as exc:
+                debug(f"/chats error: {exc!r}")
+                return self._send(500, {"error": str(exc)})
+        return self._send(404, {"error": "not found"})
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        if not self._authorized():
+            return self._send(401, {"error": "unauthorized"})
+        if path != "/chat":
+            return self._send(404, {"error": "not found"})
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            return self._send(400, {"error": "invalid JSON body"})
+        message = (body.get("message") or "").strip()
+        if not message:
+            return self._send(400, {"error": "message is required"})
+        continue_id = body.get("conversation_id") or None
+
+        # Rate gate: keep a minimum gap between Gemini sends.
+        wait = self.server.min_interval - (time.time() - self.server.last_op)
+        if wait > 0:
+            time.sleep(wait)
+        self.server.last_op = time.time()
+
+        try:
+            result = chat_once(self.server.page, self.server.svc, message, continue_id=continue_id)
+        except ServiceFailure as exc:
+            return self._send(429, {"error": "quota", "detail": exc.message[:200]})
+        except StepFailure as exc:
+            return self._send(503, {"error": exc.step, "hint": exc.hint})
+        except Exception as exc:
+            debug(f"/chat error: {exc!r}")
+            return self._send(500, {"error": str(exc)})
+
+        return self._send(200, {
+            "reply": result["reply"],
+            "conversation_id": result["conversation_id"],
+            "images": [base64.b64encode(d).decode() for d in result["images"]],
+        })
+
+
+def do_serve(host, port):
+    """Run the local API server over one warm Gemini browser session."""
+    svc = SERVICES["gemini"]
+    keys = _load_api_keys()
+    if not keys:
+        print("No API keys yet — create one first:  conjure key new")
+        return 1
+
+    print(f"Starting conjure API server — launching warm browser ({svc['url']}) ...")
+    ctx, page = launch_browser(svc["profile"])
+    try:
+        page.goto(svc["url"])
+        try:
+            page.wait_for_selector(svc["input_sel"], timeout=15000)
+        except PlaywrightTimeout:
+            pass
+        if not is_logged_in(page, svc):
+            print("Not logged in. Run:  conjure login gemini")
+            return 1
+        print("✓ logged in; browser warm")
+
+        try:
+            server = HTTPServer((host, port), _APIHandler)
+        except OSError as exc:
+            print(f"Could not bind {host}:{port} — {exc}")
+            print(f"  Port {port} may be in use; try: conjure serve --port <other>")
+            return 1
+        server.svc = svc
+        server.page = page
+        server.key_hashes = {k["hash"] for k in keys}
+        server.last_op = 0.0
+        server.min_interval = 1.5
+
+        print(f"Listening on http://{host}:{port}  ({len(keys)} key(s) active)")
+        print('  POST /chat   {"message": "...", "conversation_id": "<optional>"}')
+        print("  GET  /chats   ·   GET /health")
+        print("Ctrl+C to stop.")
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nShutting down.")
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+    return 0
 
 
 # ── CLI ───────────────────────────────────────────────────────────
@@ -1417,11 +1637,20 @@ def build_parser():
                               help="environment + selector health checks")
     p_doctor.add_argument("service", nargs="?", help="chatgpt or gemini (default: all)")
 
+    p_serve = sub.add_parser("serve", parents=[parent],
+                             help="run the local API server over a warm browser session")
+    p_serve.add_argument("--host", default="127.0.0.1", help="bind host (default: 127.0.0.1)")
+    p_serve.add_argument("--port", type=int, default=8765, help="bind port (default: 8765)")
+
+    p_key = sub.add_parser("key", parents=[parent], help="manage conjure API keys")
+    p_key.add_argument("action", choices=["new", "list", "revoke"])
+    p_key.add_argument("label", nargs="?", help="label (new) or label/prefix to revoke")
+
     return parser
 
 
 def main():
-    known = {"chat", "chats", "image", "login", "doctor"}
+    known = {"chat", "chats", "image", "login", "doctor", "serve", "key"}
     raw = sys.argv[1:]
     if not raw:
         build_parser().print_help()
@@ -1463,6 +1692,12 @@ def main():
 
     if command == "chats":
         sys.exit(do_list_chats())
+
+    if command == "serve":
+        sys.exit(do_serve(args.host, args.port))
+
+    if command == "key":
+        sys.exit(do_key(args.action, args.label))
 
     if command == "image":
         edit_image = None

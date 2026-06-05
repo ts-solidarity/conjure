@@ -1,6 +1,6 @@
 # conjure
 
-CLI for chatting with **Gemini** — and generating images — by driving its web interface with a headless browser, using your logged-in session (no API key). Ask a question, get the reply in your terminal; ask for an image, get a PNG.
+CLI for chatting with **Gemini** — and generating images — by driving its web interface with a headless browser, using your logged-in session (no Google API key). Ask a question, get the reply in your terminal; ask for an image, get a PNG. It can also run as a small local **API server** that puts your subscription chats behind your *own* API keys.
 
 ## Setup
 
@@ -62,6 +62,46 @@ conjure image --edit photo.png "make the sky purple"
 Image generation defaults to Gemini; add `--chatgpt` to use ChatGPT instead. The PNG is saved to your current directory, named from the prompt and timestamp (e.g. `a-samurai-cat-standing-in-the-rain-20260328-200143.png`).
 
 > Chat (`chat`/`chats`) is **Gemini-only**. Image generation works on both Gemini (default) and ChatGPT (`--chatgpt`).
+
+## API server
+
+Run conjure as a small **local HTTP API** over a single *warm* browser session — one Chromium launch, reused for every request (no per-call cold start). You mint conjure's own API keys; clients use them to talk to your Gemini subscription.
+
+Mint a key (the raw token is shown once), then start the server:
+
+```
+$ conjure key new my-app
+New API key — shown once, store it now:
+
+    cjr_8f3a…
+
+$ conjure serve                 # http://127.0.0.1:8765  (localhost only)
+$ conjure serve --port 9000
+```
+
+`conjure key list` shows labels + prefixes; `conjure key revoke <label>` removes one.
+
+Call it with the key:
+
+```
+# new chat (or continue by passing conversation_id)
+curl -s localhost:8765/chat -H "Authorization: Bearer cjr_…" \
+     -d '{"message": "what is the capital of France?"}'
+# → {"reply": "...", "conversation_id": "d1a5…", "images": ["<base64 png>"]}
+
+curl -s localhost:8765/chats  -H "Authorization: Bearer cjr_…"
+curl -s localhost:8765/health         # {"ok": true} — no auth
+```
+
+| method | path | body | returns |
+|---|---|---|---|
+| POST | `/chat` | `{message, conversation_id?}` | `{reply, conversation_id, images[]}` — images base64 PNG |
+| GET | `/chats` | — | `{conversations: [{id, title}]}` |
+| GET | `/health` | — | `{ok: true}` — no auth |
+
+Keys are stored **hashed** in `~/.config/conjure/api_keys.json`. Requests serialize through the one browser (one op at a time) and are rate-limited.
+
+> ⚠️ The server reuses your Gemini **subscription** session for every request — the same session conjure already uses, but as a service the volume is higher. Keep it **localhost-only**, and consider holding the subscription on a **secondary Google account** so a restriction never touches your primary identity.
 
 ## How it works
 
