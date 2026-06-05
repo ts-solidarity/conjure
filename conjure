@@ -138,6 +138,122 @@ def check_for_failure(page, svc):
             raise ServiceFailure("error", text)
 
 
+# ── Diagnostics & logging ─────────────────────────────────────────
+#
+# Automating a third-party web UI is inherently brittle: a selector change
+# upstream surfaces here as a silent "no image" or a hang. These helpers make
+# failures legible — an opt-in step trace (--verbose) and an on-failure bundle
+# (screenshot + DOM + live selector counts). The bundle is written under the
+# config dir, never cwd: the DOM contains the account name and conversation
+# history, so writing it into a working directory risks committing it.
+
+DEBUG_DIR = CONFIG_DIR / "debug"
+
+_VERBOSE = False
+
+
+def set_verbose(value: bool):
+    global _VERBOSE
+    _VERBOSE = bool(value)
+
+
+def debug(msg: str):
+    """Timestamped step/error trace — shown only with --verbose, on stderr."""
+    if _VERBOSE:
+        print(f"[{datetime.now():%H:%M:%S}] {msg}", file=sys.stderr)
+
+
+class StepFailure(Exception):
+    """A brittle automation step failed (e.g. a selector stopped matching).
+
+    Carries a human-readable step name and an actionable hint so the CLI can
+    report it cleanly instead of surfacing a raw traceback."""
+
+    def __init__(self, step: str, hint: str = ""):
+        self.step = step
+        self.hint = hint
+        super().__init__(step)
+
+
+def selector_specs(svc):
+    """Selectors worth probing, each tagged 'static' (present on a freshly
+    loaded page) or 'dynamic' (only present mid-run). --doctor and the
+    diagnostics report use this; dynamic selectors must never be reported as
+    broken just because they are absent on a fresh page."""
+    specs = []
+    if svc.get("input_sel"):
+        specs.append(("input", svc["input_sel"], "static"))
+    if svc.get("login_sels"):
+        specs.append(("login-buttons", svc["login_sels"], "static"))
+    for sel in svc.get("new_chat_sels", []):
+        specs.append(("new-chat", sel, "static"))
+    if svc.get("send_sel"):
+        specs.append(("send", svc["send_sel"], "dynamic"))
+    for sel in svc.get("stop_sels", []):
+        specs.append(("stop", sel, "dynamic"))
+    if svc.get("response_sel"):
+        specs.append(("response", svc["response_sel"], "dynamic"))
+    return specs
+
+
+def capture_diagnostics(page, svc, step: str, extra: str = ""):
+    """Write screenshot + DOM + a selector report to ~/.config/conjure/debug/<ts>/.
+
+    Returns the directory, or None if nothing could be captured. Never raises —
+    diagnostics must not mask the failure that triggered them."""
+    try:
+        ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+        dest = DEBUG_DIR / ts
+        dest.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        debug(f"could not create debug dir: {exc}")
+        return None
+
+    captured = False
+    try:
+        page.screenshot(path=str(dest / "screenshot.png"), full_page=True)
+        captured = True
+    except Exception as exc:
+        debug(f"screenshot capture failed: {exc}")
+    try:
+        (dest / "page.html").write_text(page.content(), encoding="utf-8")
+        captured = True
+    except Exception as exc:
+        debug(f"DOM capture failed: {exc}")
+
+    lines = [f"step: {step}"]
+    try:
+        lines.append(f"url:  {page.url}")
+    except Exception:
+        pass
+    lines.append("")
+    lines.append("selector resolution (matches on the page right now):")
+    for label, sel, kind in selector_specs(svc):
+        try:
+            count = page.locator(sel).count()
+        except Exception as exc:
+            count = f"error: {exc}"
+        lines.append(f"  [{kind:<7}] {label:<14} {count}   {sel}")
+    try:
+        text = _latest_assistant_text(page, svc)
+        if text:
+            lines.append("")
+            lines.append("latest assistant text:")
+            lines.append("  " + text[:1000].replace("\n", "\n  "))
+    except Exception:
+        pass
+    if extra:
+        lines.append("")
+        lines.append(extra)
+    try:
+        (dest / "report.txt").write_text("\n".join(lines), encoding="utf-8")
+        captured = True
+    except Exception as exc:
+        debug(f"report write failed: {exc}")
+
+    return dest if captured else None
+
+
 # ── Shared utilities ──────────────────────────────────────────────
 
 
@@ -575,6 +691,154 @@ def find_best_image(page, before_srcs):
 # ── Commands ──────────────────────────────────────────────────────
 
 
+def _probe_send_selector(page, svc):
+    """Verify the send control by typing a throwaway string, checking the
+    button resolves and is enabled, then clearing the field. Never sends.
+
+    Returns (ok, status): ok is True/False for a clear pass/fail, or None when
+    it genuinely could not be verified (so doctor warns rather than fails)."""
+    probe_text = "conjure doctor probe — ignore"
+    field = page.locator(svc["input_sel"])
+    try:
+        field.click()
+        try:
+            field.fill(probe_text)
+        except Exception:
+            page.keyboard.type(probe_text, delay=5)
+        time.sleep(0.5)
+        send = page.locator(svc["send_sel"])
+        count = send.count()
+        if count == 0:
+            result = (False, f"send button matched nothing: {svc['send_sel']}")
+        elif not send.first.is_enabled():
+            result = (None, f"send button present but disabled (may just need a moment): {svc['send_sel']}")
+        else:
+            result = (True, f"send button resolves and is enabled: {svc['send_sel']}")
+    except Exception as exc:
+        result = (None, f"could not verify send button ({exc})")
+    # Always clear the throwaway text so a later real run is unaffected.
+    try:
+        field.fill("")
+    except Exception:
+        try:
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Delete")
+        except Exception:
+            pass
+    return result
+
+
+def _doctor_probe_service(name, svc):
+    """Launch a headless browser, load the service, and report login state plus
+    live resolution of the static selectors. Read-only — sends no prompt."""
+    print(f"  launching headless browser → {svc['url']}")
+    try:
+        ctx, page = launch_browser(svc["profile"])
+    except Exception as exc:
+        print(f"  ✗ could not launch browser: {exc}")
+        return False
+    try:
+        try:
+            page.goto(svc["url"], timeout=30000)
+        except Exception as exc:
+            print(f"  ✗ navigation failed: {exc}")
+            return False
+        try:
+            page.wait_for_selector(svc["input_sel"], timeout=15000)
+        except PlaywrightTimeout:
+            pass
+
+        # Login gate first: a logged-out page is a login wall, so every
+        # downstream selector would falsely read as "broken".
+        if not is_logged_in(page, svc):
+            print(f"  ✗ not logged in — run: conjure --login {name}")
+            print("    (skipping selector checks; the page is a login wall)")
+            return False
+        print("  ✓ logged in")
+
+        ok = True
+
+        count = page.locator(svc["input_sel"]).count()
+        good = count > 0
+        ok = ok and good
+        print(f"  {'✓' if good else '✗'} input selector  ({count} match)  {svc['input_sel']}")
+
+        nc_matched = False
+        nc_report = []
+        for sel in svc.get("new_chat_sels", []):
+            try:
+                c = page.locator(sel).count()
+            except Exception:
+                c = 0
+            nc_report.append((sel, c))
+            nc_matched = nc_matched or c > 0
+        # New-chat has a reload fallback in the real flow, so a miss is a
+        # warning, not a hard failure.
+        print(f"  {'✓' if nc_matched else '⚠'} new-chat selector  "
+              + ("one variant matched" if nc_matched
+                 else "none matched (reload fallback would be used)"))
+        for sel, c in nc_report:
+            print(f"        {c} match   {sel}")
+
+        send_ok, send_status = _probe_send_selector(page, svc)
+        if send_ok is False:
+            ok = False
+        send_mark = {True: "✓", False: "✗", None: "⚠"}[send_ok]
+        print(f"  {send_mark} {send_status}")
+
+        dynamic = [s for s in selector_specs(svc) if s[2] == "dynamic" and s[0] != "send"]
+        if dynamic:
+            print("  · dynamic selectors (only verifiable during a real run):")
+            for label, sel, _ in dynamic:
+                print(f"        {label:<10} {sel}")
+
+        return ok
+    finally:
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+def do_doctor(targets):
+    """Environment + selector health check. Returns a process exit code."""
+    print("conjure doctor")
+    print("─" * 48)
+
+    if cloak_launch is None:
+        print("✗ dependencies: NOT installed")
+        if IMPORT_ERROR:
+            print(f"    {IMPORT_ERROR}")
+        print("    fix: cd conjure && ./setup")
+        return 1
+    print("✓ dependencies: cloakbrowser + playwright import OK")
+    print(f"· config dir: {CONFIG_DIR} "
+          f"({'exists' if CONFIG_DIR.exists() else 'missing (created on first login)'})")
+
+    overall = True
+    for name in targets:
+        svc = SERVICES[name]
+        print()
+        print(f"── {name} ──────────────")
+        profile = svc["profile"]
+        if profile.exists():
+            print(f"  ✓ profile: {profile}")
+        else:
+            print(f"  ✗ profile missing — run: conjure --login {name}")
+            overall = False
+            continue
+        if not _doctor_probe_service(name, svc):
+            overall = False
+
+    print()
+    if overall:
+        print("All checks passed.")
+    else:
+        print("Some checks failed — see above. A '✗' on a static selector means "
+              "the page markup changed; update that selector in the SERVICES table.")
+    return 0 if overall else 1
+
+
 def do_login(service_name):
     svc = SERVICES[service_name]
     print(f"Opening {service_name} for login...")
@@ -777,6 +1041,19 @@ def build_parser():
         help="open a browser to log in and save the session",
     )
     parser.add_argument(
+        "--doctor",
+        nargs="?",
+        const="",
+        metavar="SERVICE",
+        help="run environment + selector health checks (all services, or one) and exit",
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="print a step-by-step diagnostic trace to stderr",
+    )
+    parser.add_argument(
         "prompt",
         nargs="*",
         help="image prompt",
@@ -787,6 +1064,17 @@ def build_parser():
 def main():
     parser = build_parser()
     args = parser.parse_args()
+
+    set_verbose(args.verbose)
+
+    if args.doctor is not None:
+        if args.doctor:
+            if args.doctor not in SERVICES:
+                parser.error(f"unknown service: {args.doctor}. Use: chatgpt or gemini")
+            targets = [args.doctor]
+        else:
+            targets = list(SERVICES.keys())
+        sys.exit(do_doctor(targets))
 
     if args.login is not None:
         service = args.login or args.service
