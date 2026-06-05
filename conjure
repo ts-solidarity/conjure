@@ -126,10 +126,21 @@ def _latest_assistant_text(page, svc) -> str:
                     ? document.querySelectorAll(sel)
                     : document.querySelectorAll('[data-turn="assistant"]');
                 if (!els.length) return '';
-                // Clone so we never mutate the live page, then drop source chips.
-                const node = els[els.length - 1].cloneNode(true);
-                node.querySelectorAll(chipSel).forEach(e => e.remove());
-                return (node.innerText || '').trim();
+                // Read innerText from the LIVE node so line breaks survive —
+                // innerText depends on layout, and a detached clone collapses
+                // newlines. Temporarily hide source chips so they're excluded,
+                // then restore their original display.
+                const node = els[els.length - 1];
+                const chips = node.querySelectorAll(chipSel);
+                const prev = [];
+                chips.forEach(e => { prev.push(e.style.display); e.style.display = 'none'; });
+                let text = '';
+                try {
+                    text = (node.innerText || '').trim();
+                } finally {
+                    chips.forEach((e, i) => { e.style.display = prev[i] || ''; });
+                }
+                return text;
             }""",
             [response_sel, _SOURCE_CHIP_SEL],
         )
