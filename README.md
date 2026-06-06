@@ -1,6 +1,22 @@
-# conjure
+# ✦ conjure
 
-CLI for chatting with **Gemini** — and generating images — by driving its web interface with a headless browser, using your logged-in session (no Google API key). Ask a question, get the reply in your terminal; ask for an image, get a PNG. It can also run as a small local **API server** that puts your subscription chats behind your *own* API keys.
+**Use your Gemini subscription from your terminal, your scripts, and a local web app — no Google API key.**
+
+conjure drives the Gemini web app through a headless browser using your logged-in session, and exposes it three ways: a **CLI**, a Gemini-style **web UI**, and a small **HTTP API** secured by keys *you* mint. Ask a question and get the reply; ask for an image and get a PNG; attach files; browse and continue your real conversations.
+
+```
+conjure "what is the capital of France?"     # CLI: one-shot chat
+conjure serve                                 # Web UI + API at http://127.0.0.1:8765
+```
+
+## Features
+
+- 💬 **Chat** — start new chats, continue any conversation by id, list your history
+- 🖼 **Images & files** — generate images in chat (saved locally), and attach images/files to your messages
+- 🪟 **Web UI** — a Gemini-shaped local app: conversation sidebar, inline images, attachments, live titles, key management
+- 🔌 **HTTP API** — `POST /chat` and friends behind conjure-issued API keys, for your own apps and scripts
+- 🩺 **Diagnostics** — `conjure doctor` health check + automatic debug bundles (it rides the live web UI, so things can shift)
+- 🔒 **Your session, your machine** — no API key, no third party; everything runs on localhost
 
 ## Setup
 
@@ -10,21 +26,25 @@ cd conjure
 ./setup
 ```
 
-This creates a Python venv, installs [cloakbrowser](https://pypi.org/project/cloakbrowser/) (which bundles Playwright) with Chromium, and symlinks `conjure` into `~/.local/bin/`.
+`setup` creates a Python venv, installs [cloakbrowser](https://pypi.org/project/cloakbrowser/) (which bundles Playwright + Chromium), and symlinks `conjure` into `~/.local/bin/`.
 
-### First run — log in
-
-Log in once; the session is saved to `~/.config/conjure/` and reused for future headless runs:
+**Log in once** (a visible browser opens; sign in normally — the session is saved to `~/.config/conjure/` and reused headlessly):
 
 ```
 conjure login gemini
 ```
 
-This opens a visible browser window — log in normally, then it's saved.
+## Web UI
 
-## Chatting
+```
+conjure serve            # then open http://127.0.0.1:8765
+```
 
-A bare prompt starts a **new** Gemini chat and prints the reply, followed by the conversation id:
+A familiar chat interface with a distinct identity: a sidebar of your conversations (new / open / continue), messages with inline images, a `+` to **attach images or files**, conversation titles that fill in automatically, and an API-keys panel. It's served over a single *warm* browser session and talks to the same-origin API; localhost is trusted, so the UI itself needs no key.
+
+## CLI
+
+A bare prompt is a **new** chat; the reply prints with the conversation id:
 
 ```
 $ conjure "what is the capital of France?"
@@ -33,127 +53,86 @@ The capital of France is Paris.
 [chat d1a5c0b7b87b0468]  continue with:  conjure chat -c d1a5c0b7b87b0468 "..."
 ```
 
-**Continue** a conversation with `-c <id>` (the id from any earlier reply, or from `conjure chats`):
-
 ```
-conjure -c d1a5c0b7b87b0468 "and its population?"
-```
-
-**List** your recent conversations (id + title), scraped from the Gemini sidebar:
-
-```
-$ conjure chats
-Recent Gemini conversations (10):
-
-  d1a5c0b7b87b0468  Capital of France Identified
-  c7cd58c0c6b5f2ab  Create an image of a single red bicycle
-  ...
+conjure -c <id> "and its population?"     # continue a conversation
+conjure chats                              # list recent conversations (id + title)
+conjure image "a samurai cat in the rain" # (see Images below)
+conjure doctor                             # health check
+conjure -v "..."                           # verbose step trace
 ```
 
-If a reply contains images, they're downloaded to the current directory automatically (named from the message + timestamp).
+Images in a reply are saved to the current directory automatically, named from the message + timestamp.
 
 ## Images
 
-To generate an image on Gemini, **ask for one in a chat** — any images in the reply are saved to the current directory automatically (and `POST /chat` returns them as base64):
+The reliable way to make an image on Gemini is to **ask in a chat** — replies with images are saved automatically (and the API returns them as base64):
 
 ```
 conjure "create an image of a samurai cat standing in the rain"
-# → saves create-an-image-of-a-samurai-cat-20260328-200143.png
+# → create-an-image-of-a-samurai-cat-20260328-200143.png
 ```
 
-A dedicated one-shot command also exists:
+There's also a one-shot `conjure image "…"` / `conjure image --edit photo.png "…"`, but its **Gemini** path is currently unreliable — prefer asking in a chat (the command works with `--chatgpt`).
+
+## HTTP API
+
+`conjure serve` exposes a localhost API over the warm browser. Mint a key for *external* clients (the local UI needs none):
 
 ```
-conjure image --edit photo.png "make the sky purple"
-conjure image --chatgpt "a samurai cat standing in the rain"
+$ conjure key new my-app          # prints the token once
+$ conjure key list                # labels + prefixes
+$ conjure key revoke my-app
 ```
 
-> Note: `conjure image`'s **Gemini** path (the default) is currently unreliable — prefer asking in a chat for Gemini image generation. The command works with `--chatgpt`.
-
-## Web UI
-
-`conjure serve` launches a local chat **web UI** (plus the API below) over one warm browser session:
+Call it (`Authorization: Bearer cjr_…` required only from non-localhost):
 
 ```
-conjure serve            # then open http://127.0.0.1:8765 in your browser
-```
-
-A Gemini-shaped interface — a sidebar of your conversations, open / continue / new chats, messages and inline images, and an API-keys panel. It talks to the same-origin API; localhost is trusted, so the UI needs no key.
-
-> Not yet wired: model selection, extended thinking, and streaming. These require driving Gemini's own in-page controls (the model picker, etc.) through the warm browser — a planned follow-up, now looking feasible since those controls are reachable.
-
-## API server
-
-Run conjure as a small **local HTTP API** over a single *warm* browser session — one Chromium launch, reused for every request (no per-call cold start). You mint conjure's own API keys; clients use them to talk to your Gemini subscription.
-
-Mint a key (the raw token is shown once), then start the server:
-
-```
-$ conjure key new my-app
-New API key — shown once, store it now:
-
-    cjr_8f3a…
-
-$ conjure serve                 # http://127.0.0.1:8765  (localhost only)
-$ conjure serve --port 9000
-```
-
-`conjure key list` shows labels + prefixes; `conjure key revoke <label>` removes one.
-
-Call it with the key:
-
-```
-# new chat (or continue by passing conversation_id)
 curl -s localhost:8765/chat -H "Authorization: Bearer cjr_…" \
-     -d '{"message": "what is the capital of France?"}'
-# → {"reply": "...", "conversation_id": "d1a5…", "images": ["<base64 png>"]}
-
-curl -s localhost:8765/chats  -H "Authorization: Bearer cjr_…"
-curl -s localhost:8765/health         # {"ok": true} — no auth
+     -d '{"message":"what is the capital of France?"}'
+# → {"reply":"…","conversation_id":"d1a5…","images":["<base64 png>"],"title":"…"}
 ```
 
 | method | path | body | returns |
 |---|---|---|---|
-| POST | `/chat` | `{message, conversation_id?}` | `{reply, conversation_id, images[]}` — images base64 PNG |
-| GET | `/chats` | — | `{conversations: [{id, title}]}` |
-| GET | `/health` | — | `{ok: true}` — no auth |
+| `POST` | `/chat` | `{message, conversation_id?, file?: {name, data}}` | `{reply, conversation_id, images[], title}` |
+| `GET` | `/chats` | — | `{conversations: [{id, title}]}` |
+| `GET` | `/chats/{id}` | — | `{messages: [{role, text, images[], files[]}]}` |
+| `GET` | `/health` | — | `{ok: true}` (no auth) |
+| `GET·POST·DELETE` | `/keys` | `{label}` on POST | key management (**localhost only**) |
 
-Keys are stored **hashed** in `~/.config/conjure/api_keys.json`. Requests serialize through the one browser (one op at a time) and are rate-limited.
+`file.data` is base64; images come back as base64 PNG. Keys are stored **hashed** in `~/.config/conjure/`. Requests serialize through the one browser and are rate-limited.
 
-> ⚠️ The server reuses your Gemini **subscription** session for every request — the same session conjure already uses, but as a service the volume is higher. Keep it **localhost-only**, and consider holding the subscription on a **secondary Google account** so a restriction never touches your primary identity.
+> ⚠️ The server reuses your Gemini **subscription** session. Keep it **localhost-only**, and consider holding the subscription on a **secondary Google account** so a problem never touches your primary identity.
 
 ## How it works
 
-1. Launches a headless Chromium instance via cloakbrowser with a persistent profile (your session cookies).
-2. For a new chat it starts fresh; to continue, it navigates to the conversation's `…/app/<id>` URL, which rehydrates the history.
-3. Submits the message, waits for the response to complete (stop-button detection + content stability), and reads the reply text.
-4. Downloads any images in the reply via an in-page `fetch()` (falling back to the native download button / canvas capture).
+1. Launches one headless Chromium via cloakbrowser with a persistent profile (your session cookies); `serve` keeps it **warm** so every request reuses it (no per-call cold start).
+2. New chat → fresh page; continue → navigate to the conversation's `…/app/<id>` URL, which rehydrates history.
+3. Sends the message and waits for completion by watching Gemini's **stop button** (present while generating, gone when done).
+4. Reads the reply (stripping source-citation chips), and harvests images — AI-generated images via canvas, user uploads via Playwright's request API (cross-origin).
 
 ## Troubleshooting
 
-conjure drives the live Gemini web UI, so a layout change upstream can break it. Two tools help you find out *what* broke.
-
-**Health check** — verify setup and that the page selectors still resolve, without sending anything:
+Because conjure drives the live web UI, an upstream layout change can break it. Two tools tell you *what* broke:
 
 ```
-conjure doctor            # check every configured service
-conjure doctor gemini     # check just one
+conjure doctor [gemini]     # deps, login state, and whether the key selectors still resolve
+conjure -v "..."            # step-by-step trace to stderr
 ```
 
-It reports whether dependencies are installed, whether you're logged in, and whether the critical selectors (prompt input, new-chat, send button) still match. A `✗` on a selector means that service changed its markup and the matching entry in the `SERVICES` table in `conjure` needs updating. Selectors that only exist mid-run (stop button, response container, conversation list) are listed but verified only during real use.
+On any failure, conjure writes a debug bundle — screenshot, page HTML, live selector counts — to `~/.config/conjure/debug/<timestamp>/` (under the config dir, not your cwd, since the HTML holds account/conversation data). A `✗` on a static selector means update the `SERVICES` table in `conjure`.
 
-**Verbose trace** — print each step as it happens (works with any command):
+**Exit codes:** `0` ok · `1` setup/unexpected · `2` quota · `3` a page step failed (likely a changed selector) · `4` no image produced.
 
-```
-conjure -v "a cat in a top hat"
-```
+## Limitations
 
-When a run fails, conjure writes a diagnostics bundle — screenshot, page HTML, and live selector counts — to `~/.config/conjure/debug/<timestamp>/` and prints the path. The bundle lives under the config dir rather than your working directory because the HTML contains your account name and conversation history.
-
-**Exit codes:** `0` success · `1` unexpected or setup error · `2` quota hit · `3` a page step failed (likely a changed selector) · `4` no image produced (image command).
+- **Model selection, extended thinking, and streaming** aren't wired yet — they need driving Gemini's own in-page controls (reachable, planned).
+- **`conjure image` on Gemini** is flaky; ask in a chat instead.
+- **Images in *reopened* chats** are best-effort (older lazy-loaded thumbnails may not appear).
+- One warm browser means requests **serialize** (one at a time); it's tuned for a single user.
+- It automates a third-party UI with your session — inherently against Gemini's ToS and brittle to upstream changes. Personal use; your call.
 
 ## Requirements
 
 - Python 3.10+
-- A Google account (and, optionally, a ChatGPT account for `image --chatgpt`)
-```
+- A Google account (and optionally a ChatGPT account for `image --chatgpt`)
